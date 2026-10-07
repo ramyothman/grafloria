@@ -34,19 +34,24 @@ header { padding: 10px 24px 12px; border-bottom: 1px solid var(--gf-line); backg
 .head-links { margin-left: auto; display: flex; gap: 16px; font-size: 12.5px; font-weight: 500; }
 .head-links a { color: var(--gf-accent); text-decoration: none; }
 .head-links a:hover { text-decoration: underline; }
-h1 { margin: 0 0 2px; font-size: 19px; letter-spacing: -.3px; }
+h1 { margin: 0; font-size: 19px; letter-spacing: -.3px; }
+/* The description moved into the "About & how to test" panel (demo.js); the
+   header is the brand row and the title, so the board gets the page. */
 .blurb { margin: 0; color: var(--gf-mut); font-size: 13px; max-width: 120ch; }
-#canvas { width: 100%; height: calc(100vh - 100px); }
+#canvas { width: 100%; height: calc(100vh - 78px); }
 
 /* ── The gallery side menu (built by demo.js from the generated manifest) ── */
 #grafloria-nav-toggle {
-  position: fixed; left: 14px; bottom: 14px; z-index: 60;
-  width: 42px; height: 42px; border-radius: 50%; border: 1px solid var(--gf-line);
-  background: var(--gf-panel); color: var(--gf-ink); font-size: 17px; cursor: pointer;
-  box-shadow: var(--an-shadow); display: flex; align-items: center; justify-content: center;
-  transition: transform .15s, opacity .15s;
+  /* A TAB on the left edge, not a floating disc in the corner: the collapsed
+     menu stays discoverable ("closed the side menu — can't get it back"). */
+  position: fixed; left: 0; top: 50%; transform: translateY(-50%); z-index: 60;
+  writing-mode: vertical-rl; transform-origin: center;
+  padding: 12px 6px 12px 5px; border: 1px solid var(--gf-line); border-left: 0; border-radius: 0 8px 8px 0;
+  background: var(--gf-panel); color: var(--gf-ink); font: 600 12px/1 ui-sans-serif, system-ui, sans-serif;
+  letter-spacing: .04em; cursor: pointer; box-shadow: var(--an-shadow);
+  display: flex; align-items: center; gap: 6px; transition: background .15s, color .15s, opacity .15s;
 }
-#grafloria-nav-toggle:hover { transform: scale(1.06); border-color: var(--gf-soft); }
+#grafloria-nav-toggle:hover { background: var(--gf-accent); color: #fff; border-color: var(--gf-accent); }
 body.nav-open #grafloria-nav-toggle { opacity: 0; pointer-events: none; }
 #grafloria-nav {
   position: fixed; top: 0; left: 0; bottom: 0; width: 264px; z-index: 55;
@@ -92,6 +97,8 @@ body.nav-open #grafloria-nav { transform: none; }
 #grafloria-howto .ht-head button { border: 0; background: none; font-size: 18px; line-height: 1; cursor: pointer;
   color: var(--gf-mut); padding: 0 2px; }
 #grafloria-howto .ht-head button:hover { color: var(--gf-ink); }
+#grafloria-howto .ht-about { margin: 10px 14px 4px; padding: 0 0 10px; border-bottom: 1px solid var(--gf-line); font-size: 12.5px; line-height: 1.5; color: var(--gf-mut); }
+#grafloria-howto .ht-steps { margin: 8px 14px 0; font-size: 11px; font-weight: 600; letter-spacing: .4px; text-transform: uppercase; color: var(--gf-mut); }
 #grafloria-howto ol { margin: 8px 0 12px; padding-left: 30px; }
 #grafloria-howto li { margin: 7px 8px 7px 0; line-height: 1.45; overflow-wrap: anywhere; }
 #grafloria-howto-open { position: fixed; top: 16px; right: 16px; z-index: 50; width: 34px; height: 34px;
@@ -109,3 +116,87 @@ body.nav-open #grafloria-nav { transform: none; }
 @media (min-width: 1100px) {
   body.howto-open { padding-right: 312px; }
 }
+
+/* ── Framework switcher (header pills) ── */
+.fw-switch { display: inline-flex; margin-left: 10px; border: 1px solid var(--gf-line); border-radius: 999px; padding: 2px; gap: 2px; }
+.fw-switch button { border: 0; background: none; color: var(--gf-mut); font: 600 11.5px ui-sans-serif, system-ui, sans-serif;
+  padding: 4px 11px; border-radius: 999px; cursor: pointer; }
+.fw-switch button:hover { color: var(--gf-ink); }
+.fw-switch button.on { background: var(--gf-accent); color: #fff; }
+.code-toggle { border: 1px solid var(--gf-soft); background: var(--gf-wash); color: var(--gf-accent);
+  font: 600 12px ui-monospace, Menlo, monospace; padding: 4px 12px; border-radius: 7px; cursor: pointer; }
+.code-toggle:hover { background: var(--gf-accent); color: #fff; }
+
+/* ── The code drawer ── */
+#gf-code { position: fixed; left: 0; right: 0; bottom: 0; height: 46vh; z-index: 52;
+  background: var(--gf-panel); border-top: 1px solid var(--gf-line);
+  box-shadow: 0 -12px 40px rgba(35, 42, 61, .14); display: none; flex-direction: column; }
+body.code-open #gf-code { display: flex; }
+@media (min-width: 1100px) { body.nav-open #gf-code { left: 264px; } }
+.gfc-bar { display: flex; align-items: center; gap: 2px; padding: 6px 14px 0; border-bottom: 1px solid var(--gf-line); flex-wrap: wrap; }
+.gfc-tab { padding: 8px 13px 9px; font: 600 13px ui-sans-serif, system-ui, sans-serif; color: var(--gf-mut);
+  background: none; border: 0; border-bottom: 2px solid transparent; cursor: pointer; }
+.gfc-tab:hover { color: var(--gf-ink); }
+.gfc-tab.on { color: var(--gf-accent); border-bottom-color: var(--gf-accent); }
+.gfc-badge { margin-left: 10px; font-size: 11px; color: #059669; background: #ecfdf5; border: 1px solid #a7f3d0;
+  padding: 2px 9px; border-radius: 999px; font-weight: 600; }
+@media (prefers-color-scheme: dark) { .gfc-badge { background: rgba(5,150,105,.15); border-color: rgba(5,150,105,.4); color: #34d399; } }
+.gfc-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; padding-bottom: 4px; }
+.gfc-run { padding: 5px 14px; border-radius: 7px; border: 0; background: var(--gf-accent); color: #fff;
+  font: 600 12px ui-sans-serif, system-ui, sans-serif; cursor: pointer; }
+.gfc-run:hover { background: var(--gf-deep); }
+.gfc-run:disabled { opacity: .6; cursor: default; }
+.gfc-reset, .gfc-copy { padding: 5px 12px; border-radius: 7px; border: 1px solid var(--gf-soft); background: var(--gf-wash);
+  color: var(--gf-accent); font: 600 12px ui-sans-serif, system-ui, sans-serif; cursor: pointer; }
+.gfc-reset:hover, .gfc-copy:hover { background: var(--gf-accent); color: #fff; }
+.gfc-close { border: 0; background: none; color: var(--gf-mut); font-size: 20px; cursor: pointer; padding: 0 4px; }
+.gfc-close:hover { color: var(--gf-ink); }
+.gfc-note { margin: 8px 20px 6px; font-size: 12.5px; color: var(--gf-mut); }
+.gfc-note b { color: var(--gf-ink); }
+.gfc-note code { font-family: ui-monospace, Menlo, monospace; background: var(--gf-wash); padding: 1px 5px; border-radius: 4px; }
+.gfc-body { flex: 1; overflow: hidden; display: flex; padding: 0 20px 14px; }
+.gfc-editor { flex: 1; resize: none; border: 1px solid var(--gf-line); border-radius: 10px; padding: 12px 14px;
+  background: var(--gf-bg); color: var(--gf-ink); font: 12.5px/1.6 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  tab-size: 2; outline: none; white-space: pre; }
+.gfc-editor:focus { border-color: var(--gf-accent); }
+.gfc-view { flex: 1; overflow: auto; margin: 0; border: 1px solid var(--gf-line); border-radius: 10px; padding: 12px 14px;
+  background: var(--gf-bg); font: 12.5px/1.6 ui-monospace, "SF Mono", Menlo, Consolas, monospace; tab-size: 2; }
+.tk-k { color: #7c3aed; } .tk-s { color: #059669; } .tk-c { color: #94a3b8; font-style: italic; }
+@media (prefers-color-scheme: dark) { .tk-k { color: #b79df5; } .tk-s { color: #4ade80; } .tk-c { color: #64748b; } }
+
+/* ── The Run overlay: the visitor's edited demo, in an iframe over the original ── */
+.gfc-overlay { position: fixed; left: 0; right: 0; bottom: 0; z-index: 40; background: var(--gf-bg); }
+@media (min-width: 1100px) { body.nav-open .gfc-overlay { left: 264px; } body.howto-open .gfc-overlay { right: 312px; } }
+body.code-open .gfc-overlay { bottom: 46vh; }
+.gfc-frame { width: 100%; height: 100%; border: 0; }
+/* Error banner over the preview when the visitor's edited code throws. */
+.gfc-err { position: absolute; left: 0; right: 0; bottom: 0; z-index: 3; display: flex; align-items: flex-start; gap: 10px;
+  padding: 12px 16px; background: #fef2f2; border-top: 2px solid #dc2626; color: #7f1d1d;
+  font: 13px/1.5 ui-sans-serif, system-ui, sans-serif; box-shadow: 0 -6px 20px rgba(220, 38, 38, .12); }
+.gfc-err b { color: #b91c1c; white-space: nowrap; }
+.gfc-err span { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; overflow: auto; flex: 1; white-space: pre-wrap; word-break: break-word; }
+.gfc-err-x { margin-left: auto; border: 0; background: none; color: #b91c1c; font-size: 18px; line-height: 1; cursor: pointer; padding: 0 2px; }
+@media (prefers-color-scheme: dark) { .gfc-err { background: #2a1414; color: #fecaca; border-top-color: #ef4444; }
+  .gfc-err b, .gfc-err-x { color: #fca5a5; } }
+
+/* ── Embed mode (inside the Run iframe): no chrome, full-bleed canvas ── */
+body.gf-embed #canvas { height: 100vh; }
+
+/* ── Real-variant file tabs + the Angular-implementation overlay ── */
+.gfc-files { display: flex; gap: 2px; margin: 0 0 8px; flex-wrap: wrap; }
+.gfc-file { padding: 4px 12px; border-radius: 7px 7px 0 0; border: 1px solid var(--gf-line); border-bottom: 0;
+  background: var(--gf-bg); color: var(--gf-mut); font: 600 12px ui-monospace, Menlo, monospace; cursor: pointer; }
+.gfc-file.on { background: var(--gf-panel); color: var(--gf-accent); border-color: var(--gf-soft); }
+.gfc-filebody { white-space: pre; }
+.gfc-variant-banner { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); z-index: 2;
+  background: var(--gf-accent); color: #fff; font: 600 12px ui-sans-serif, system-ui, sans-serif;
+  padding: 6px 16px; border-radius: 999px; box-shadow: 0 6px 20px rgba(59, 82, 217, .35); }
+.gfc-variant-banner b { color: #fff; text-decoration: underline; }
+
+/* ── Monaco editor surface (progressive enhancement over the textarea/pre) ── */
+.gfc-filebar { display: none; gap: 2px; padding: 0 20px; flex-wrap: wrap; }
+.gfc-filebar .gfc-file { padding: 4px 12px; border-radius: 7px 7px 0 0; border: 1px solid var(--gf-line); border-bottom: 0;
+  background: var(--gf-bg); color: var(--gf-mut); font: 600 12px ui-monospace, Menlo, monospace; cursor: pointer; }
+.gfc-filebar .gfc-file.on { background: var(--gf-panel); color: var(--gf-accent); border-color: var(--gf-soft); }
+.gfc-monaco { display: none; flex: 1; min-height: 0; border: 1px solid var(--gf-line); border-radius: 10px; overflow: hidden; }
+body.code-open .gfc-body { position: relative; }

@@ -37,8 +37,17 @@ export * from './SetStrokePointsCommand'; // wave13/stroke-edit (the edit tool's
 export * from './StrokeLifecycleCommands'; // draw + erase as undoable gestures (live audit)
 export * from './ReconnectLinkCommand'; // wave12 (reconnect undo)
 export * from './SetLinkLabelCommand'; // wave4/interaction (in-place text editing)
+export * from './SetLinkDisplayLabelCommand'; // visio-depth (edge display-label editing)
+export * from './SetLinkPathTypeCommand'; // visio-panel (undoable route: smooth | orthogonal)
+export * from './SetNodeShapeConfigCommand'; // visio-panel (metadata.shape keys, e.g. cornerRadius)
 
 export * from './PortCommands'; // wave6/ports (dynamic auto-ports)
 
 // C — node stacking order as undoable commands (dashboard z-order).
 export * from './NodeZOrderCommands';
+
+// T9 — shape data (node.data) as an undoable, per-key edit.
+export * from './SetNodeDataCommand';
+
+// T3 — Align & Distribute (Visio/Figma-style multi-node arrangement).
+export * from './AlignCommands';

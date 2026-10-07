@@ -2,14 +2,17 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="msvalidate.01" content="125A5292629F5E845ADA752B252D613D" />
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Grafloria — the framework-agnostic diagram engine</title>
-<meta name="description" content="Flow charts, dashboards, UML, ERD and real-time collaboration — one headless core with native Angular, React and Vue bindings. Open source, MIT.">
+<title>Grafloria — diagrams and dashboards, one engine</title>
+<meta name="description" content="Grafloria is an MIT diagram and dashboard engine for JavaScript: one headless core, native Angular, React and Vue bindings, one document format and one undo stack. Grafloria Diagrams for flowcharts, workflow editors, UML and ER; Grafloria Dashboards for draggable, resizable widget layouts.">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="alternate icon" href="favicon-32.png">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
-<meta property="og:title" content="Grafloria — the framework-agnostic diagram engine">
-<meta property="og:description" content="Flow charts, dashboards, UML, ERD and real-time collaboration — native in Angular, React and Vue. MIT.">
+<link rel="canonical" href="https://grafloria.com/">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"SoftwareApplication","name":"Grafloria","url":"https://grafloria.com/","description":"Grafloria is an MIT diagram and dashboard engine for JavaScript: one headless core, native Angular, React and Vue bindings, one document format and one undo stack.","applicationCategory":"DeveloperApplication","operatingSystem":"Web","license":"https://opensource.org/licenses/MIT","offers":{"@type":"Offer","price":"0","priceCurrency":"USD"},"screenshot":"https://grafloria.com/og-image.png","softwareHelp":"https://grafloria.com/learn/","sameAs":["https://github.com/grafloria/grafloria","https://www.npmjs.com/org/grafloria"]},{"@type":"WebSite","url":"https://grafloria.com/","name":"Grafloria","publisher":{"@type":"Organization","name":"Grafloria","url":"https://grafloria.com/","logo":"https://grafloria.com/apple-touch-icon.png"}}]}</script>
+<meta property="og:title" content="Grafloria — diagrams and dashboards, one engine">
+<meta property="og:description" content="Grafloria is an MIT diagram and dashboard engine for JavaScript: one headless core, native Angular, React and Vue bindings, one document format and one undo stack.">
 <meta property="og:url" content="https://grafloria.com">
 <meta property="og:image" content="https://grafloria.com/og-image.png">
 <meta property="og:image:width" content="1280">
@@ -28,10 +31,12 @@
     --bg: #FCFCFF;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { overflow-x: hidden; }
   body {
     font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     background: var(--bg); color: var(--ink);
     -webkit-font-smoothing: antialiased; line-height: 1.6;
+    overflow-x: hidden; /* the hero glow bleeds past the fold by design — clip, never scroll */
   }
   .wrap { max-width: 1060px; margin: 0 auto; padding: 0 24px; }
   a { color: var(--indigo); text-decoration: none; }
@@ -44,15 +49,61 @@
   .nav .name { font-weight: 700; font-size: 20px; letter-spacing: -0.3px; }
   .nav .links { margin-left: auto; display: flex; gap: 22px; font-size: 15px; font-weight: 500; }
 
-  .hero { padding: 84px 0 30px; text-align: center; }
-  .hero img { width: 108px; height: 108px; }
+  /* Hero — two columns: the pitch on the left, a LIVE Grafloria canvas on the right. */
+  .hero { padding: 60px 0 20px; display: grid; grid-template-columns: 1fr 1.05fr; gap: 40px; align-items: center; }
+    .fw-band { margin-top: 16px; }
+  .fw-label { display: block; font-size: 11.5px; font-weight: 700; letter-spacing: .08em;
+    text-transform: uppercase; color: var(--slate, #5A6478); margin-bottom: 8px; }
+  .fw-row { display: flex; flex-wrap: wrap; gap: 8px; }
+  .fw-row a { font-size: 13.5px; font-weight: 600; padding: 7px 14px; border-radius: 999px;
+    border: 1px solid #94A5F0; background: #fff; color: #3B52D9; text-decoration: none; }
+  .fw-row a span { opacity: .55; margin-left: 2px; }
+  .fw-row a:hover { background: #EEF1FE; text-decoration: none; }
+  .hero .brandmark { display: flex; align-items: center; gap: 10px; margin-bottom: 20px; }
+  .hero .brandmark img { width: 40px; height: 40px; }
+  .hero .brandmark span { font-weight: 700; font-size: 17px; letter-spacing: -0.3px; }
   .hero h1 {
-    margin: 26px auto 14px; font-size: clamp(34px, 5.4vw, 56px); font-weight: 800;
-    letter-spacing: -1.5px; line-height: 1.08; max-width: 17ch; text-wrap: balance;
+    margin: 0 0 16px; font-size: clamp(34px, 4.4vw, 52px); font-weight: 800;
+    letter-spacing: -1.5px; line-height: 1.06; max-width: 15ch; text-wrap: balance;
   }
   .hero h1 em { font-style: normal; color: var(--indigo); }
-  .hero p.lede { max-width: 56ch; margin: 0 auto; font-size: 19px; color: var(--slate); }
-  .cta { margin: 34px 0 10px; display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+  .hero p.lede { max-width: 48ch; margin: 0; font-size: 18px; color: var(--slate); }
+  @media (max-width: 900px) { .hero { grid-template-columns: 1fr; gap: 26px; padding: 40px 0 10px; } }
+
+  /* The live canvas frame — a real, draggable, flow-animated workflow, not a screenshot. */
+  .stage { position: relative; }
+  .stage .glow { position: absolute; inset: -14% -8% -20% -8%; z-index: 0; border-radius: 40px;
+    background: radial-gradient(60% 55% at 55% 42%, rgba(148,165,240,.42), rgba(148,165,240,0) 70%); filter: blur(6px); }
+  .canvasframe { position: relative; z-index: 1; height: 400px; border: 1px solid var(--line);
+    border-radius: 18px; background: #fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='22' height='22'%3E%3Ccircle cx='1.4' cy='1.4' r='1.4' fill='%23dfe3f0'/%3E%3C/svg%3E");
+    box-shadow: 0 18px 60px rgba(35,42,61,.14); overflow: hidden; opacity: 0; transform: translateY(10px) scale(.99);
+    transition: opacity .6s ease, transform .6s cubic-bezier(.2,.7,.3,1); }
+  .canvasframe.ready { opacity: 1; transform: none; }
+  .canvasframe .live-badge { position: absolute; top: 12px; right: 12px; z-index: 3; font-size: 11.5px; font-weight: 700;
+    color: var(--indigo); background: var(--indigo-wash); border: 1px solid var(--indigo-soft); border-radius: 999px;
+    padding: 4px 11px; display: flex; align-items: center; gap: 6px; pointer-events: none; }
+  .canvasframe .live-badge .dot { width: 7px; height: 7px; border-radius: 50%; background: #16a34a; box-shadow: 0 0 0 0 rgba(22,163,74,.5); animation: pulse-dot 2s infinite; }
+  @keyframes pulse-dot { 0% { box-shadow: 0 0 0 0 rgba(22,163,74,.5); } 70% { box-shadow: 0 0 0 6px rgba(22,163,74,0); } 100% { box-shadow: 0 0 0 0 rgba(22,163,74,0); } }
+  .canvasframe .hint { position: absolute; bottom: 10px; left: 14px; z-index: 3; font-size: 12px; color: var(--slate); pointer-events: none; }
+  #hero-canvas { width: 100%; height: 100%; }
+  .canvasframe .skeleton { position: absolute; inset: 0; z-index: 2; display: flex; align-items: center; justify-content: center;
+    color: var(--indigo-soft); font-size: 13px; font-weight: 600; letter-spacing: .04em; }
+  @media (prefers-reduced-motion: reduce) { .canvasframe { transition: none; } .canvasframe .live-badge .dot { animation: none; } }
+
+  /* The connecting-line spine — a hand-routed Grafloria edge between sections:
+     a soft S-curve in an indigo gradient, animated flow particles, and real
+     "handle" ports at each end. Grafloria's own edge aesthetic as page furniture. */
+  .connector { display: flex; justify-content: center; margin: 0; }
+  .connector svg { width: 84px; height: 96px; overflow: visible; }
+  .connector .wire { fill: none; stroke: var(--indigo-soft); stroke-width: 2.5; stroke-linecap: round; }
+  .connector .flow { fill: none; stroke: var(--indigo); stroke-width: 2.5; stroke-linecap: round;
+    stroke-dasharray: 1.5 12; opacity: .95; }
+  @media (prefers-reduced-motion: no-preference) { .connector .flow { animation: cflow 1.6s linear infinite; } }
+  @keyframes cflow { to { stroke-dashoffset: -27; } }
+  .connector .handle { fill: #fff; stroke: var(--indigo); stroke-width: 2.5; }
+  .connector .handle-ring { fill: var(--indigo); opacity: .12; }
+
+  .cta { margin: 28px 0 10px; display: flex; gap: 14px; flex-wrap: wrap; }
   .btn {
     display: inline-block; padding: 12px 26px; border-radius: 10px; font-weight: 600; font-size: 16px;
   }
@@ -67,21 +118,67 @@
     background: var(--ink); color: #E8ECFB; padding: 14px 22px; border-radius: 10px;
   }
   .install code b { color: var(--indigo-soft); font-weight: 600; }
+  .ph-badge { display: block; margin-top: 22px; line-height: 0; }
+  .ph-badge img { width: 250px; height: 54px; }
 
   .frameworks { padding: 30px 0 10px; text-align: center; color: var(--slate); font-size: 15px; }
   .frameworks span { margin: 0 12px; font-weight: 600; color: var(--ink); }
 
-  section.shots { padding: 64px 0 8px; }
-  .shots h2 { font-size: 30px; letter-spacing: -0.6px; margin-bottom: 8px; }
-  .shots .sub { color: var(--slate); margin-bottom: 28px; max-width: 62ch; }
-  .shot { display: block; border: 1px solid var(--line); border-radius: 14px; overflow: hidden;
-          background: #fff; text-decoration: none; }
-  .shot:hover { border-color: var(--indigo-soft); text-decoration: none; }
-  .shot img { display: block; width: 100%; height: auto; }
-  .shot span { display: block; padding: 12px 16px; font-size: 14.5px; font-weight: 600; color: var(--ink); }
-  .shot.wide { margin-bottom: 18px; }
-  .shotgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 18px; }
-  .shots .more { margin: 22px 0 8px; font-weight: 600; }
+  section.shots { padding: 56px 0 8px; }
+  .shots > .wrap > h2 { font-size: 30px; letter-spacing: -0.6px; margin-bottom: 8px; text-align: center; }
+  .shots > .wrap > .sub { color: var(--slate); margin: 0 auto 10px; max-width: 60ch; text-align: center; }
+
+  /* Zig-zag story rows: a real text story beside a LIVE, playable canvas. */
+  .story { display: grid; grid-template-columns: 1fr 1.12fr; gap: 44px; align-items: center; padding: 30px 0; }
+  .story.rev .story-text { order: 2; }
+  .story.rev .story-stage { order: 1; }
+  /* Full-width variant: the wide n8n workflow gets a big reactflow.dev-style stage
+     (text above, canvas spanning the row) so the flow renders at a larger zoom. */
+  .story.wide { grid-template-columns: 1fr; gap: 22px; }
+  .story.wide .story-text { max-width: 780px; }
+  .story.wide .story-canvas { height: 440px; }
+  .story-text .chip { display: inline-block; font-size: 12px; font-weight: 700; letter-spacing: .5px;
+    text-transform: uppercase; color: var(--indigo); background: var(--indigo-wash); border-radius: 999px; padding: 4px 12px; margin-bottom: 14px; }
+  .story-text h3 { font-size: 26px; letter-spacing: -0.5px; margin-bottom: 12px; text-wrap: balance; }
+  .story-text p { color: var(--slate); font-size: 16px; margin-bottom: 8px; }
+  .story-text p b { color: var(--ink); font-weight: 650; }
+  .story-text .go { display: inline-block; margin-top: 12px; font-weight: 600; font-size: 15px; }
+  .story-stage { position: relative; }
+  .story-canvas { position: relative; height: 380px; border: 1px solid var(--line); border-radius: 16px;
+    background: #fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='22' height='22'%3E%3Ccircle cx='1.4' cy='1.4' r='1.4' fill='%23e6e9f4'/%3E%3C/svg%3E");
+    box-shadow: 0 14px 44px rgba(35,42,61,.10); overflow: hidden; }
+  .story-canvas .live-badge { position: absolute; top: 11px; right: 11px; z-index: 3; font-size: 11px; font-weight: 700;
+    color: var(--indigo); background: var(--indigo-wash); border: 1px solid var(--indigo-soft); border-radius: 999px;
+    padding: 3px 10px; display: flex; align-items: center; gap: 5px; pointer-events: none; }
+  .story-canvas .live-badge .dot { width: 6px; height: 6px; border-radius: 50%; background: #16a34a; }
+  .story-canvas .cv { width: 100%; height: 100%; }
+  .story-canvas .skel { position: absolute; inset: 0; z-index: 2; display: flex; align-items: center; justify-content: center;
+    color: var(--indigo-soft); font-size: 12.5px; font-weight: 600; background: #fff; opacity: 1; transition: opacity .4s ease; }
+  .story-canvas.ready .skel { opacity: 0; pointer-events: none; }
+  /* n8n-style node cards, painted inside each node's foreignObject (workflow story). */
+  .story-canvas .cv foreignObject { overflow: visible; }
+  .story-canvas .cv .n8n-card { display: flex; align-items: center; gap: 9px; width: 100%; height: 100%;
+    box-sizing: border-box; padding: 0 11px; background: #fff; color: #2d2e3a; position: relative;
+    border: 1px solid #dfe2ea; border-left-width: 3px; border-radius: 9px; font-family: system-ui, sans-serif;
+    box-shadow: 0 1px 2px rgba(16,24,40,.06), 0 1px 3px rgba(16,24,40,.05); }
+  .story-canvas .cv .n8n-badge { width: 30px; height: 30px; border-radius: 8px; flex: none; display: flex;
+    align-items: center; justify-content: center; font-size: 17px; line-height: 1; color: #fff; background: #667; }
+  .story-canvas .cv .n8n-body { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+  .story-canvas .cv .n8n-title { font-weight: 600; font-size: 13px; line-height: 1.15; color: #262a35;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .story-canvas .cv .n8n-sub { font-size: 9.5px; letter-spacing: .4px; text-transform: uppercase; color: #8a91a2;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .story-canvas .cv .n8n-card.cat-trigger { border-radius: 26px 9px 9px 26px; padding-left: 14px; }
+  .story-canvas .cv .cat-trigger .n8n-badge { background: #10b981; } .story-canvas .cv .cat-trigger { border-left-color: #10b981; }
+  .story-canvas .cv .cat-http    .n8n-badge { background: #0ea5e9; } .story-canvas .cv .cat-http    { border-left-color: #0ea5e9; }
+  .story-canvas .cv .cat-set     .n8n-badge { background: #6366f1; } .story-canvas .cv .cat-set     { border-left-color: #6366f1; }
+  .story-canvas .cv .cat-if      .n8n-badge { background: #f97316; } .story-canvas .cv .cat-if      { border-left-color: #f97316; }
+  .story-canvas .cv .cat-merge   .n8n-badge { background: #06b6d4; } .story-canvas .cv .cat-merge   { border-left-color: #06b6d4; }
+  .story-canvas .cv .cat-ai      .n8n-badge { background: #8b5cf6; } .story-canvas .cv .cat-ai      { border-left-color: #8b5cf6; }
+  .story-canvas .cv .cat-notify  .n8n-badge { background: #ec4899; } .story-canvas .cv .cat-notify  { border-left-color: #ec4899; }
+  @media (max-width: 860px) { .story, .story.rev { grid-template-columns: 1fr; gap: 20px; }
+    .story.rev .story-text { order: 1; } .story.rev .story-stage { order: 2; } }
+  .shots .more { margin: 26px 0 8px; font-weight: 600; text-align: center; }
 
   section.features { padding: 70px 0; }
   .features h2, .code h2 { font-size: 30px; letter-spacing: -0.6px; margin-bottom: 8px; text-wrap: balance; }
@@ -139,6 +236,12 @@
   footer .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   footer img { width: 22px; height: 22px; }
   footer .fam { margin-left: auto; }
+  .prod-band { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin: 18px 0 6px; }
+  .prod { display: block; border: 1px solid var(--line); border-radius: 12px; background: #fff; padding: 14px 16px; color: var(--ink); text-decoration: none; }
+  .prod:hover { border-color: var(--indigo-soft); text-decoration: none; }
+  .prod b { display: block; font-size: 16px; margin-bottom: 4px; }
+  .prod span { display: block; font-size: 13.5px; color: var(--slate); line-height: 1.45; }
+  .prod i { display: block; font-style: normal; font-weight: 600; font-size: 13.5px; color: var(--indigo); margin-top: 8px; }
 </style>
 </head>
 <body>
@@ -148,10 +251,13 @@
     <img src="favicon.svg" alt="">
     <span class="name">grafloria</span>
     <nav class="links">
-      <a href="https://github.com/grafloria/grafloria">GitHub</a>
-      <a href="https://www.npmjs.com/org/grafloria">npm</a>
+      <a href="diagrams/">Diagrams</a>
+      <a href="dashboards/">Dashboards</a>
+      <a href="learn/">Learn</a>
       <a href="demos/">Demos</a>
-      <a href="compare/">Compare</a>
+      <a href="blog/">Blog</a>
+      <a href="https://github.com/grafloria/grafloria" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://www.npmjs.com/org/grafloria" target="_blank" rel="noopener">npm</a>
     </nav>
   </div>
 </header>
@@ -159,41 +265,146 @@
 <main>
   <div class="wrap">
     <div class="hero">
-      <img src="favicon.svg" alt="Grafloria logo — a bloom of connected diagram nodes">
-      <h1>The <em>framework-agnostic</em> diagram engine</h1>
-      <p class="lede">
-        Flow charts, dashboards, UML, ERD, and real-time collaboration — one headless core,
-        with bindings that feel native in Angular, React, and Vue. Open source, MIT.
-      </p>
-      <div class="cta">
-        <a class="btn primary" href="https://github.com/grafloria/grafloria">Star on GitHub</a>
-        <a class="btn ghost" href="https://www.npmjs.com/org/grafloria">Browse packages</a>
+      <div class="hero-copy">
+        <h1>Diagrams and dashboards, <em>one engine</em></h1>
+        <p class="lede">
+          Grafloria is an MIT diagram and dashboard engine for JavaScript: one headless core, native
+          Angular, React and Vue bindings, one document format and one undo stack.
+        </p>
+        <div class="prod-band" aria-label="Products">
+          <a class="prod" href="diagrams/"><b>Grafloria Diagrams</b><span>Flowcharts, workflow editors, UML and ER diagrams — routing, auto-layout, undo and collaboration built in.</span><i>The diagram library →</i></a>
+          <a class="prod" href="dashboards/"><b>Grafloria Dashboards</b><span>Draggable, resizable widgets on a grid or a splitter layout — undo, nesting and persistence built in.</span><i>The dashboard layout library →</i></a>
+        </div>
+        <div class="cta">
+          <a class="btn primary" href="demos/">Try the live demos</a>
+          <a class="btn ghost" href="https://github.com/grafloria/grafloria">Star on GitHub</a>
+        </div>
+        <div class="install">
+          <code>npm install <b>@grafloria/react</b>   <i># or angular · vue · element</i></code>
+        </div>
+        <!-- Developers search by framework — each chip is a dedicated landing page. -->
+        <div class="fw-band" aria-label="Framework guides">
+          <span class="fw-label">Guides for your stack</span>
+          <div class="fw-row">
+            <a href="react/">⚛ React &amp; Next.js <span>→</span></a>
+            <a href="angular/">🅰 Angular <span>→</span></a>
+            <a href="vue/">✳ Vue 3 <span>→</span></a>
+            <a href="javascript/">〈/〉 JavaScript <span>→</span></a>
+          </div>
+        </div>
+        <a class="ph-badge" href="https://www.producthunt.com/products/grafloria?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-grafloria" target="_blank" rel="noopener noreferrer">
+          <img alt="Grafloria - The framework-agnostic diagram engine | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1204715&amp;theme=light&amp;t=1784932924027">
+        </a>
       </div>
-      <div class="install">
-        <code>npm install <b>@grafloria/react</b>   <i># or @grafloria/renderer-angular · @grafloria/vue · @grafloria/element</i></code>
+      <div class="stage">
+        <div class="glow"></div>
+        <div class="canvasframe" id="hero-frame">
+          <span class="live-badge"><span class="dot"></span>live · drag a node</span>
+          <div class="skeleton" id="hero-skeleton">rendering…</div>
+          <div id="hero-canvas"></div>
+          <span class="hint">A real Grafloria canvas — not a screenshot.</span>
+        </div>
       </div>
-      <p class="frameworks">Native in <span>Angular</span>·<span>React</span>·<span>Vue</span>· and every framework via <span>&lt;grafloria-flow&gt;</span></p>
     </div>
+  </div>
+
+  <div class="connector" aria-hidden="true">
+    <svg viewBox="0 0 84 96"><path class="wire" d="M42 6 C 24 34, 60 62, 42 90"/><path class="flow" d="M42 6 C 24 34, 60 62, 42 90"/><circle class="handle-ring" cx="42" cy="6" r="8"/><circle class="handle" cx="42" cy="6" r="4"/><circle class="handle-ring" cx="42" cy="90" r="8"/><circle class="handle" cx="42" cy="90" r="4"/></svg>
   </div>
 
   <section class="shots">
     <div class="wrap">
       <h2>See it running</h2>
-      <p class="sub">Screenshots from the live gallery — every one links to the working demo. 100+ pages, each driven by real gestures in CI.</p>
-      <a class="shot wide" href="demos/interaction/n8n-workflow.html">
-        <img src="shots/workflow.png" alt="An n8n-style workflow editor built with Grafloria: typed nodes, an AI agent with model, memory and tool ports, and a run toolbar" loading="lazy">
-        <span>Workflow editor — typed wires, AI-agent ports, step execution</span>
-      </a>
-      <div class="shotgrid">
-        <a class="shot" href="demos/dashboard/dashboard-builder.html">
-          <img src="shots/dashboard.png" alt="A tabbed dashboard built with the Grafloria dashboard kit: KPI cards, charts and a drag-pack grid" loading="lazy">
-          <span>Dashboard builder — drag-pack grid, undoable gestures</span>
-        </a>
-        <a class="shot" href="demos/diagrams/class-uml.html">
-          <img src="shots/uml.png" alt="A UML class diagram from pure data: compartments and hollow-triangle inheritance" loading="lazy">
-          <span>UML &amp; ER kits — diagrams from pure data</span>
-        </a>
+      <p class="sub">Not screenshots — every canvas below is a real Grafloria instance you can drag, pan and play with. The things people always wonder about, rendered live.</p>
+
+      <div class="story wide">
+        <div class="story-text">
+          <span class="chip">Workflow automation</span>
+          <h3>Runnable workflows, n8n-style</h3>
+          <p><b>Wire a pipeline and watch it flow.</b> Typed ports keep incompatible nodes from
+            connecting, animated wires carry the data, and an AI-agent node fans out to its
+            model, memory and tool sub-nodes.</p>
+          <p>The same engine drives a real execution model — run, pause, step — not just a picture of one.</p>
+          <a class="go" href="demos/interaction/n8n-workflow.html">Open the full workflow builder →</a>
+        </div>
+        <div class="story-stage">
+          <div class="story-canvas" data-demo="n8n"><span class="live-badge"><span class="dot"></span>live</span><div class="skel">rendering…</div><div class="cv"></div></div>
+        </div>
       </div>
+
+      <div class="connector" aria-hidden="true"><svg viewBox="0 0 84 96"><path class="wire" d="M42 6 C 24 34, 60 62, 42 90"/><path class="flow" d="M42 6 C 24 34, 60 62, 42 90"/><circle class="handle-ring" cx="42" cy="6" r="8"/><circle class="handle" cx="42" cy="6" r="4"/><circle class="handle-ring" cx="42" cy="90" r="8"/><circle class="handle" cx="42" cy="90" r="4"/></svg></div>
+
+      <div class="story wide">
+        <div class="story-text">
+          <span class="chip">Dashboards</span>
+          <h3>Dashboards from pure data</h3>
+          <p><b>Declare views as data; the kit packs the grid.</b> KPI cards, line, bar and donut
+            widgets tile a 12-column grid that is 100% of its container — fluid by default, fitted to the frame or growing with it,
+            packed on a grid or shared through splitters. Drag from anywhere, the caption or a grip; resize from any edge; undo any gesture,
+            or do all of it from the keyboard with every move announced.</p>
+          <p>Save and restore round-trips the whole board byte-for-byte — layouts, splitter trees and drag handle included. One flag, <code>static</code>, makes the same board read-only.</p>
+          <a class="go" href="demos/dashboard/fluid-board.html">Open the fluid dashboard →</a>
+          <a class="go" href="demos/dashboard/dashboard-builder.html">Open the dashboard builder →</a>
+        </div>
+        <div class="story-stage">
+          <div class="story-canvas" data-demo="dashboard"><span class="live-badge"><span class="dot"></span>live</span><div class="skel">rendering…</div><div class="cv"></div></div>
+        </div>
+      </div>
+
+      <div class="connector" aria-hidden="true"><svg viewBox="0 0 84 96"><path class="wire" d="M42 6 C 24 34, 60 62, 42 90"/><path class="flow" d="M42 6 C 24 34, 60 62, 42 90"/><circle class="handle-ring" cx="42" cy="6" r="8"/><circle class="handle" cx="42" cy="6" r="4"/><circle class="handle-ring" cx="42" cy="90" r="8"/><circle class="handle" cx="42" cy="90" r="4"/></svg></div>
+
+      <div class="story">
+        <div class="story-text">
+          <span class="chip">UML · class diagrams</span>
+          <h3>Class diagrams that draw themselves</h3>
+          <p><b>From pure data to a full UML card.</b> Each class renders its name, attributes and
+            methods in real compartments; inheritance draws a hollow triangle, aggregation a hollow diamond.</p>
+          <p>No hand-placing boxes — pass classes and relationships, the kit does the rest.</p>
+          <a class="go" href="demos/diagrams/class-uml.html">Open the UML demo →</a>
+        </div>
+        <div class="story-stage">
+          <div class="story-canvas" data-demo="uml"><span class="live-badge"><span class="dot"></span>live</span><div class="skel">rendering…</div><div class="cv"></div></div>
+        </div>
+      </div>
+
+      <div class="connector" aria-hidden="true"><svg viewBox="0 0 84 96"><path class="wire" d="M42 6 C 24 34, 60 62, 42 90"/><path class="flow" d="M42 6 C 24 34, 60 62, 42 90"/><circle class="handle-ring" cx="42" cy="6" r="8"/><circle class="handle" cx="42" cy="6" r="4"/><circle class="handle-ring" cx="42" cy="90" r="8"/><circle class="handle" cx="42" cy="90" r="4"/></svg></div>
+
+      <div class="story rev">
+        <div class="story-text">
+          <span class="chip">ERD · database schemas</span>
+          <h3>Your schema, wired up</h3>
+          <p><b>Entities as tables, keys as ports.</b> Every column is a row you can wire from;
+            primary keys carry a PK badge, foreign keys an FK, and relationships attach with
+            crow's-foot cardinality.</p>
+          <p>Edit it in the canvas — rename columns, drag new links — and export the model.</p>
+          <a class="go" href="demos/diagrams/erd-editor.html">Open the ER editor →</a>
+        </div>
+        <div class="story-stage">
+          <div class="story-canvas" data-demo="er"><span class="live-badge"><span class="dot"></span>live</span><div class="skel">rendering…</div><div class="cv"></div></div>
+        </div>
+      </div>
+
+      <div class="connector" aria-hidden="true"><svg viewBox="0 0 84 96"><path class="wire" d="M42 6 C 24 34, 60 62, 42 90"/><path class="flow" d="M42 6 C 24 34, 60 62, 42 90"/><circle class="handle-ring" cx="42" cy="6" r="8"/><circle class="handle" cx="42" cy="6" r="4"/><circle class="handle-ring" cx="42" cy="90" r="8"/><circle class="handle" cx="42" cy="90" r="4"/></svg></div>
+
+      <div class="story">
+        <div class="story-text">
+          <span class="chip">Mermaid</span>
+          <h3>Your Mermaid, but you can grab it</h3>
+          <p><b>Paste Mermaid text and get a real diagram.</b> Not a picture of one — every
+            node on the right is live: drag it, connect it, re-route the edges, export it
+            to SVG or PDF.</p>
+          <p>Flowchart, ER, class and state parse today, validated against Mermaid v11 by a
+            28-case oracle; anything else fails safe and says so rather than drawing
+            something wrong.</p>
+          <a class="go" href="mermaid/">How Mermaid support works →</a>
+        </div>
+        <div class="story-stage">
+          <div class="story-canvas" data-demo="mermaid"><span class="live-badge"><span class="dot"></span>live</span><div class="skel">rendering…</div><div class="cv"></div></div>
+        </div>
+      </div>
+
+      </div>
+
       <p class="more"><a href="demos/">Browse all 100+ live demos →</a></p>
     </div>
   </section>
@@ -211,7 +422,7 @@
           <p>ELK, dagre, force, tree, grid, and a zero-config <code>auto</code> — one prop. ELK loads lazily, so you ship none of it until a layout runs.</p></div>
         <div class="card"><span class="chip">Dashboards</span>
           <h3>A drag-pack dashboard kit</h3>
-          <p>Declared as pure data: tabbed views, drag &amp; resize with live re-packing, undo, and built-in KPI, line, bar, donut, funnel and table widgets.</p></div>
+          <p>Declared as pure data: fluid tabbed views, grid or split layout, fit or grow sizing, drag by caption or grip with live re-packing, undo, keyboard operation with a live region, a static viewer mode, and built-in KPI, line, bar, donut, funnel and table widgets.</p></div>
         <div class="card"><span class="chip">Collab</span>
           <h3>Multiplayer in one prop</h3>
           <p>CRDT sync over any transport, live cursors, anchored comment threads with a conversation panel — serverless cross-tab or your own websocket.</p></div>
@@ -337,12 +548,215 @@
 </main>
 
 <footer>
+  <div class="wrap" style="display:flex;flex-wrap:wrap;gap:8px 20px;padding-bottom:18px;font-size:14px">
+    <a href="react/">React &amp; Next.js</a> ·
+    <a href="angular/">Angular</a> ·
+    <a href="vue/">Vue 3</a> ·
+    <a href="javascript/">JavaScript</a> ·
+    <a href="mermaid/">Mermaid</a> ·
+    <a href="compare/">Compare</a> ·
+    <a href="demos/">All demos</a>
+  </div>
   <div class="wrap row">
     <img src="favicon.svg" alt="">
     <span>© 2026 Grafloria · MIT License</span>
     <span class="fam">A sibling of <a href="https://atloria.dev">Atloria</a></span>
   </div>
 </footer>
+
+<script type="module">
+  // Every canvas on this page is a REAL Grafloria instance — the product rendering
+  // itself, not screenshots. The engine bundle is ~6MB, so we load it ONCE, lazily,
+  // and render each canvas only when it scrolls into view. Same-origin → CSP-clean.
+  let bundlePromise = null;
+  const loadBundle = () => (bundlePromise ??= import('./demos/shell/grafloria.js'));
+
+  const flow = (stroke) => ({ animation: { type: 'flow', speed: 'normal', direction: 'forward' }, ...(stroke ? { stroke } : {}) });
+  const N = (id, x, y, label, fill, stroke, shape) => ({
+    id, position: { x, y }, size: { width: 150, height: 56 }, label,
+    shape: shape ? { type: shape, fill, stroke } : undefined,
+    style: shape ? undefined : { fill, stroke, strokeWidth: 1.5 },
+  });
+
+  // Each demo's spec, built lazily from the bundle's kit helpers.
+  /** The Mermaid source shown in the story — parsed live, not pre-baked. */
+  const MERMAID_SRC = [
+    'flowchart LR',
+    '  A[Order received] --> B{In stock?}',
+    '  B --> C[Pick items]',
+    '  C --> D([Ship])',
+  ].join('\n');
+
+  /** A parsed DiagramModel → the {nodes, edges} spec render() takes. */
+  const modelToSpec = (d) => ({
+    nodes: d.getNodes().map((n) => ({
+      id: n.id, position: { ...n.position }, size: { ...n.size },
+      label: n.getLabel?.() ?? '',
+      ...(n.getMetadata?.('shape') ? { shape: n.getMetadata('shape') } : {}),
+    })),
+    edges: d.getLinks().map((l) => ({
+      id: l.id, source: l.sourceNodeId, target: l.targetNodeId,
+      label: l.labels?.[0]?.text ?? l.label ?? undefined,
+    })),
+  });
+
+  const DEMOS = {
+    mermaid: (k) => {
+      const r = k.importDiagramText(MERMAID_SRC);
+      return r?.diagram ? modelToSpec(r.diagram) : { nodes: [], edges: [] };
+    },
+    workflow: (k) => ({
+      nodes: [
+        N('trig', 30, 150, 'Webhook',      '#ecfdf5', '#059669', 'terminal'),
+        N('http', 230, 150, 'HTTP Request','#eef2ff', '#3B52D9'),
+        N('code', 430, 150, 'Transform',   '#f1f5f9', '#475569'),
+        N('ai',   640, 60,  'AI Agent',    '#f5f3ff', '#7c3aed'),
+        N('note', 640, 250, 'Notify',      '#fdf4ff', '#9333ea', 'document'),
+      ],
+      edges: [
+        { id: 'a', source: 'trig', target: 'http', style: flow() },
+        { id: 'b', source: 'http', target: 'code', style: flow() },
+        { id: 'c', source: 'code', target: 'ai',   style: flow('#7c3aed') },
+        { id: 'd', source: 'code', target: 'note', style: flow('#9333ea') },
+      ],
+    }),
+    // A genuine n8n-style graph — HTML node cards with icon badges, an If branch
+    // (green true / red false), a Merge, and the signature AI-agent sub-nodes
+    // hanging below on violet dashed wires. Distinct from the hero's linear flow.
+    n8n: (k) => {
+      const card = (cat, glyph, title, sub) => ({
+        tag: 'div', className: 'n8n-card cat-' + cat, children: [
+          { tag: 'div', className: 'n8n-badge', text: glyph },
+          { tag: 'div', className: 'n8n-body', children: [
+            { tag: 'div', className: 'n8n-title', text: title },
+            { tag: 'div', className: 'n8n-sub', text: sub },
+          ] },
+        ],
+      });
+      const P = { shape: 'circle', size: 9 };
+      const NN = (id, x, y, w, h, cat, glyph, title, sub, ports) => ({
+        id, position: { x, y }, size: { width: w, height: h },
+        metadata: { html: { content: card(cat, glyph, title, sub), padding: 0 } },
+        shape: { type: 'rect', fill: 'none', stroke: 'none' },
+        style: { fill: 'transparent', stroke: 'transparent', strokeWidth: 0 }, ports,
+      });
+      const inP = (id) => ({ id: id + '_in', side: 'left', type: 'input', shape: P });
+      const outP = (id) => ({ id: id + '_out', side: 'right', type: 'output', shape: P });
+      const abs = (id, side, x, y, type) => ({ id, side, type, shape: P, layout: { strategy: 'absolute', args: { units: 'px', x, y } } });
+      const main = () => ({ stroke: '#9aa2b1', strokeWidth: 2, arrowHead: { type: 'arrow', size: 8, filled: true } });
+      const yes = () => ({ stroke: '#16a34a', strokeWidth: 2, arrowHead: { type: 'arrow', size: 8, filled: true } });
+      const no = () => ({ stroke: '#dc2626', strokeWidth: 2, arrowHead: { type: 'arrow', size: 8, filled: true } });
+      const ai = () => ({ stroke: '#8b5cf6', strokeWidth: 2, strokeDasharray: '2 5', arrowHead: { type: 'none' } });
+      const bez = (id, s, sh, t, th, style) => ({ id, source: s, target: t, sourceHandle: sh, targetHandle: th, type: 'bezier', style });
+      return {
+        nodes: [
+          NN('start', 20, 180, 180, 60, 'trigger', '▶', 'On Schedule', 'Trigger', [outP('start')]),
+          NN('http', 260, 180, 200, 60, 'http', '🌐', 'Fetch Orders', 'HTTP Request', [inP('http'), outP('http')]),
+          NN('iff', 520, 180, 180, 60, 'if', '⋔', 'New order?', 'If', [inP('iff'), abs('iff_true', 'right', 180, 20, 'output'), abs('iff_false', 'right', 180, 42, 'output')]),
+          NN('agent', 780, 40, 210, 82, 'ai', '🤖', 'Draft Reply', 'AI Agent', [inP('agent'), outP('agent'), abs('agent_model', 'bottom', 62, 82, 'input'), abs('agent_mem', 'bottom', 140, 82, 'input')]),
+          NN('model', 720, 210, 168, 54, 'ai', '🧠', 'Chat Model', 'gpt-5', [abs('model_out', 'top', 84, 0, 'output')]),
+          NN('mem', 920, 210, 150, 54, 'ai', '💾', 'Memory', 'Buffer', [abs('mem_out', 'top', 75, 0, 'output')]),
+          NN('set', 800, 350, 190, 60, 'set', '✏️', 'Skip Order', 'Edit Fields', [inP('set'), outP('set')]),
+          NN('merge', 1090, 180, 180, 60, 'merge', '🔀', 'Merge', 'Combine', [abs('merge_in1', 'left', 0, 20, 'input'), abs('merge_in2', 'left', 0, 40, 'input'), outP('merge')]),
+          NN('slack', 1330, 180, 190, 60, 'notify', '🔔', 'Send Slack', 'Notify', [inP('slack')]),
+        ],
+        edges: [
+          bez('e1', 'start', 'start_out', 'http', 'http_in', main()),
+          bez('e2', 'http', 'http_out', 'iff', 'iff_in', main()),
+          bez('e3', 'iff', 'iff_true', 'agent', 'agent_in', yes()),
+          bez('e4', 'iff', 'iff_false', 'set', 'set_in', no()),
+          bez('e5', 'agent', 'agent_out', 'merge', 'merge_in1', main()),
+          bez('e6', 'set', 'set_out', 'merge', 'merge_in2', main()),
+          bez('e7', 'merge', 'merge_out', 'slack', 'slack_in', main()),
+          bez('e8', 'model', 'model_out', 'agent', 'agent_model', ai()),
+          bez('e9', 'mem', 'mem_out', 'agent', 'agent_mem', ai()),
+        ],
+      };
+    },
+    dashboard: (k) => k.dashboard({ views: [{ id: 'ov', name: 'Overview', widgets: [
+      { id: 'k1', kind: 'kpi', span: 3, rows: 1, data: { label: 'Total revenue', value: '$6.81M', delta: 12.4, deltaLabel: 'vs last qtr', spark: [42,45,47,51,50,55,59,61,60,65,71,76] } },
+      { id: 'k2', kind: 'kpi', span: 3, rows: 1, data: { label: 'New customers', value: '1,284', delta: 8.1, deltaLabel: 'vs last qtr', spark: [70,74,79,83,88,92,96,101,108,116,124,131] } },
+      { id: 'ln', kind: 'line', span: 6, rows: 2, title: 'Revenue trend', data: { series: [{ name: 'Revenue', values: [42,45,47,51,50,55,59,61,60,65,71,76] }], labels: ['J','F','M','A','M','J','J','A','S','O','N','D'] } },
+      { id: 'dn', kind: 'donut', span: 6, rows: 2, title: 'By region', data: { slices: [ { label: 'EMEA', value: 2.9, color: '#3B52D9' }, { label: 'AMER', value: 2.4, color: '#94A5F0' }, { label: 'APAC', value: 1.5, color: '#059669' } ], centerLabel: '$6.8M' } },
+    ] }] }),
+    uml: (k) => k.umlDiagram({
+      classes: [
+        { id: 'Animal', abstract: true, position: { x: 340, y: 20 }, attributes: ['# name: String'], methods: ['+ speak(): void'] },
+        { id: 'Dog', position: { x: 150, y: 250 }, attributes: ['+ breed: String'], methods: ['+ fetch(): void'] },
+        { id: 'Cat', position: { x: 560, y: 250 }, attributes: ['+ indoor: bool'], methods: ['+ purr(): void'] },
+      ],
+      relationships: [
+        { from: 'Dog', to: 'Animal', kind: 'inheritance' },
+        { from: 'Cat', to: 'Animal', kind: 'inheritance' },
+      ],
+    }),
+    er: (k) => k.erDiagram({
+      editable: true,
+      entities: [
+        { id: 'CUSTOMERS', name: 'Customers', position: { x: 40, y: 40 }, columns: [ { name: 'id', type: 'int', pk: true }, { name: 'name', type: 'varchar' }, { name: 'email', type: 'varchar' } ] },
+        { id: 'ORDERS', name: 'Orders', position: { x: 420, y: 120 }, columns: [ { name: 'id', type: 'int', pk: true }, { name: 'customer_id', type: 'int', fk: true }, { name: 'total', type: 'decimal' } ] },
+      ],
+      relationships: [ { from: 'CUSTOMERS', to: 'ORDERS', cardinality: 'one-to-many' } ],
+    }),
+  };
+
+  async function mount(frame) {
+    const kind = frame.dataset.demo;
+    const host = frame.querySelector('.cv');
+    const skel = frame.querySelector('.skel');
+    let k;
+    try { k = await loadBundle(); } catch { skel.textContent = 'demo bundle unavailable'; return; }
+    try {
+      const spec = DEMOS[kind](k);
+      const api = k.render(spec, host);
+      // HTML node cards (the n8n cards) only paint at the 'decorations' LOD tier
+      // (zoom >= 0.5), but a story canvas fits a wide graph at ~0.35 zoom, which
+      // would drop them. Pin a single all-detail tier so cards always render —
+      // costless for these tiny scenes.
+      try {
+        // Everything EXCEPT 'routing': obstacle-aware routing detours edges around
+        // node bodies (ugly loops on a hand-placed graph); off ⇒ clean port-to-port
+        // beziers, the n8n look.
+        api.getModel?.().setLODConfig?.({ tiers: [{ name: 'all', minZoom: 0,
+          features: new Set(['labels', 'icons', 'borders', 'shadows', 'ports', 'decorations', 'handles', 'link-detail', 'gradients']) }] });
+      } catch { /* older bundle without setLODConfig — falls back to zoom tiers */ }
+      requestAnimationFrame(() => {
+        api.fitView?.(30);
+        api.renderNow?.();
+        frame.classList.add('ready');
+        if (skel) { skel.style.opacity = '0'; skel.style.pointerEvents = 'none'; }
+      });
+    } catch (e) { if (skel) skel.textContent = 'render error'; }
+  }
+
+  // Lazy-mount every canvas (the hero frame + the four story frames) as it nears the viewport.
+  const frames = [
+    (() => { const f = document.getElementById('hero-frame'); f.dataset.demo = 'workflow'; f.querySelector('#hero-canvas').classList.add('cv'); f.querySelector('#hero-skeleton').classList.add('skel'); return f; })(),
+    ...document.querySelectorAll('.story-canvas'),
+  ];
+  if ('IntersectionObserver' in window) {
+    const io = new IntersectionObserver((es) => es.forEach((e) => {
+      if (e.isIntersecting) { io.unobserve(e.target); mount(e.target); }
+    }), { rootMargin: '200px' });
+    frames.forEach((f) => io.observe(f));
+  } else {
+    frames.forEach(mount);
+  }
+</script>
+
+
+<script>
+  // PAGE SCROLL WINS on landing pages. The canvas binder preventDefaults wheel
+  // (zoom) — correct in the tool pages, wrong under a reader's scrolling
+  // thumb: the page froze wherever the pointer crossed a diagram. Stop the
+  // wheel at capture phase so the binder never sees it (the browser then
+  // scrolls normally); drag-to-pan and every click still work. pan-y lets
+  // vertical TOUCH pans through for the same reason.
+  for (const el of document.querySelectorAll('#hero-canvas, .story-canvas')) {
+    el.addEventListener('wheel', (e) => e.stopPropagation(), { capture: true, passive: true });
+  }
+</script>
+<style>#hero-canvas, .story-canvas , #hero-canvas, .story-canvas * { touch-action: pan-y !important; }</style>
 
 </body>
 </html>
