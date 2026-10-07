@@ -1,0 +1,95 @@
+// Bake a framework demo app's REAL source files into docs/demos-<fw>/sources.json,
+// keyed by route. The gallery shell's framework tab shows these files — generated
+// from the same files the compiler built, so the drawer can never drift from
+// what actually runs.
+//
+//     node tools/bake-variant-sources.mjs <angular|react|vue>   (after building)
+
+import { readFileSync, readdirSync, writeFileSync, mkdirSync, cpSync, rmSync, existsSync, statSync } from 'fs';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
+
+const FW = process.argv[2];
+if (!['angular', 'react', 'vue', 'qwik'].includes(FW)) throw new Error('usage: bake-variant-sources.mjs <angular|react|vue|qwik>');
+
+const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+const APP = join(root, 'apps', `demos-${FW}`);
+const DIST = FW === 'angular'
+  ? join(root, 'dist', 'apps', 'demos-angular', 'browser')
+  : join(root, 'dist', 'apps', `demos-${FW}`);
+const OUT = join(root, 'docs', `demos-${FW}`);
+
+// route → demo folder/file, from each app's route table.
+let pairs;
+if (FW === 'angular') {
+  const rc = readFileSync(join(APP, 'src', 'app', 'app.routes.ts'), 'utf8');
+  pairs = [...rc.matchAll(/path: '([^']+)',\s*loadComponent: \(\) => import\('\.\/demos\/([^/]+)\//g)]
+    .map((m) => ({ route: m[1], dir: join(APP, 'src', 'app', 'demos', m[2]) }));
+} else {
+  // The Qwik app's gallery lives in apps/demos-qwik/gallery/ (its src/ is the
+  // server-rendered showcase).
+  const rc = readFileSync(join(APP, FW === 'qwik' ? 'gallery' : 'src', 'routes.ts'), 'utf8');
+  // 'cat/name': () => import('./demos/<file>')  — file may be .tsx or .vue
+  pairs = [...rc.matchAll(/'([\w-]+\/[\w-]+)':\s*\(\) => import\('\.\/demos\/([\w.-]+)'\)/g)]
+    .map((m) => ({ route: m[1], file: m[2] }));
+}
+if (!pairs.length) throw new Error(`bake: no routes parsed for ${FW}`);
+
+const sources = {};
+for (const p of pairs) {
+  if (FW === 'angular') {
+    const files = readdirSync(p.dir).sort().flatMap((name) => {
+      const text = readFileSync(join(p.dir, name), 'utf8');
+      // Split an inline `template: \`…\`` component into two drawer tabs — the
+      // .ts (template swapped for a templateUrl reference) and the extracted
+      // .component.html — so every Angular demo shows its markup like a real
+      // multi-file project (DevExtreme-style), without touching source files.
+      if (name.endsWith('.component.ts') && !/templateUrl\s*:/.test(text)) {
+        const m = text.match(/template\s*:\s*`([\s\S]*?)`\s*,/);
+        if (m) {
+          const html = m[1].replace(/^\n/, '').replace(/\n\s*$/, '');
+          const base = name.replace(/\.ts$/, '.html');
+          // de-indent the template for a clean .html view
+          const lines = html.split('\n');
+          const indent = Math.min(...lines.filter((l) => l.trim()).map((l) => l.match(/^\s*/)[0].length));
+          const dedented = lines.map((l) => l.slice(indent)).join('\n');
+          const ts = text.replace(m[0], `templateUrl: './${base}',`);
+          return [{ name, text: ts }, { name: base, text: dedented }];
+        }
+      }
+      return [{ name, text }];
+    });
+    sources[p.route] = files;
+  } else {
+    // react/vue/qwik: the demo file (a .tsx or a .vue SFC). Resolve the exact name.
+    const base = join(APP, FW === 'qwik' ? 'gallery' : 'src', 'demos');
+    let file = p.file;
+    if (!existsSync(join(base, file))) {
+      for (const ext of ['.tsx', '.ts', '.vue']) { if (existsSync(join(base, file + ext))) { file = file + ext; break; } }
+    }
+    // …plus the helper modules beside it that it imports (`from './x'`, and
+    // theirs in turn): a demo whose controller lives in a sibling file shows it
+    // in the drawer too, as an Angular demo's folder does.
+    const files = [];
+    const seen = new Set();
+    const visit = (name) => {
+      if (seen.has(name)) return;
+      seen.add(name);
+      const text = readFileSync(join(base, name), 'utf8');
+      files.push({ name, text });
+      for (const m of text.matchAll(/(?:from|import)\s+['"]\.\/([\w.-]+)['"]/g)) {
+        const dep = [m[1], `${m[1]}.ts`, `${m[1]}.tsx`].find((n) => existsSync(join(base, n)) && !n.endsWith('.vue'));
+        if (dep && !/\.worker\./.test(dep)) visit(dep);
+      }
+    };
+    visit(file);
+    sources[p.route] = files;
+  }
+}
+
+if (!existsSync(join(DIST, 'index.html'))) throw new Error(`bake: dist missing — build demos-${FW} first`);
+rmSync(OUT, { recursive: true, force: true });
+mkdirSync(OUT, { recursive: true });
+cpSync(DIST, OUT, { recursive: true });
+writeFileSync(join(OUT, 'sources.json'), JSON.stringify({ routes: sources }));
+console.log(`baked ${pairs.length} ${FW} routes (${Object.values(sources).reduce((n, f) => n + f.length, 0)} files) → docs/demos-${FW}/`);

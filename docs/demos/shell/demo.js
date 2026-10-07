@@ -84,28 +84,31 @@ async function buildNav() {
   } catch {
     return; // no manifest (run index-gen) → page still works, just no menu
   }
-  const { DEMOS, CATEGORY_LABEL, CATEGORY_ORDER } = mod;
+  const { DEMOS, FEATURED, CATEGORY_LABEL, CATEGORY_ORDER } = mod;
   const here = location.pathname.replace(/.*\/([^/]+\/[^/]+\.html)$/, '$1'); // <cat>/<file>.html
 
   const byCat = new Map();
+  const byRel = new Map();
   for (const d of DEMOS) {
     if (!byCat.has(d.cat)) byCat.set(d.cat, []);
     byCat.get(d.cat).push(d);
+    byRel.set(d.rel.replace(/\.html$/, ''), d);
   }
   const cats = [...byCat.keys()].sort(
     (a, b) => ((CATEGORY_ORDER.indexOf(a) + 1 || 99) - (CATEGORY_ORDER.indexOf(b) + 1 || 99))
   );
 
   const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
-  const list = cats
+  const item = (d) => {
+    const current = d.rel === here;
+    return `<a class="an-item${current ? ' current' : ''}${d.isNew ? ' an-is-new' : ''}" href="../${esc(d.rel)}"${current ? ' aria-current="page"' : ''} data-name="${esc(d.name.toLowerCase())}${d.isNew ? ' new' : ''}">${d.isNew ? '<span class="an-new" title="Added or reworked in the latest wave">New</span>' : ''}${esc(d.name)}</a>`;
+  };
+  // Featured group first — same flagships-on-top order as the gallery index.
+  const featuredItems = (FEATURED ?? []).map((k) => byRel.get(k)).filter(Boolean).map(item).join('');
+  const featuredGroup = featuredItems ? `<div class="an-group an-featured"><div class="an-cat">★ Featured</div>${featuredItems}</div>` : '';
+  const list = featuredGroup + cats
     .map((cat) => {
-      const items = byCat
-        .get(cat)
-        .map((d) => {
-          const current = d.rel === here;
-          return `<a class="an-item${current ? ' current' : ''}${d.isNew ? ' an-is-new' : ''}" href="../${esc(d.rel)}"${current ? ' aria-current="page"' : ''} data-name="${esc(d.name.toLowerCase())}${d.isNew ? ' new' : ''}">${d.isNew ? '<span class="an-new" title="Added or reworked in the latest wave">New</span>' : ''}${esc(d.name)}</a>`;
-        })
-        .join('');
+      const items = byCat.get(cat).map(item).join('');
       return `<div class="an-group"><div class="an-cat">${esc(CATEGORY_LABEL[cat] ?? cat)}</div>${items}</div>`;
     })
     .join('');
@@ -115,15 +118,17 @@ async function buildNav() {
   nav.setAttribute('aria-label', 'Demo gallery');
   nav.innerHTML =
     `<div class="an-head"><a class="an-home" href="../index.html"><img src="../shell/logo.svg" alt="">Grafloria demos</a>` +
-    `<button class="an-close" aria-label="Close menu" title="Close (Esc)">×</button></div>` +
+    `<button class="an-close" aria-label="Collapse menu" title="Collapse (Esc) — the tab at the left edge brings it back">‹</button></div>` +
     `<input class="an-search" type="search" placeholder="Filter demos…  ( / )" aria-label="Filter demos" autocomplete="off">` +
     `<div class="an-list">${list}</div>` +
     `<div class="an-foot">${DEMOS.length} demos · every one MIT · <a href="https://grafloria.com">grafloria.com</a></div>`;
 
   const toggle = document.createElement('button');
   toggle.id = 'grafloria-nav-toggle';
+  toggle.setAttribute('aria-label', 'Expand the demos menu');
+  toggle.title = 'Demos menu';
   toggle.setAttribute('aria-label', 'Open demo menu');
-  toggle.innerHTML = '☰';
+  toggle.innerHTML = '☰ Demos';
 
   document.body.append(toggle, nav);
 
@@ -181,11 +186,16 @@ function buildHowTo(spec) {
 
   const panel = document.createElement('aside');
   panel.id = 'grafloria-howto';
+  // The demo's description lives HERE, not under the title: a visitor gets a
+  // clean board and reads the story when they open the panel (the gallery
+  // index still shows the first lines on each card).
   panel.innerHTML = `
     <div class="ht-head">
-      <span>How to test</span>
+      <span>About &amp; how to test</span>
       <button id="grafloria-howto-toggle" title="collapse">×</button>
     </div>
+    ${spec.blurb ? `<p class="ht-about">${escapeHtml(spec.blurb)}</p>` : ''}
+    <div class="ht-steps">How to test</div>
     <ol>${spec.howTo.map((s) => `<li>${escapeHtml(s)}</li>`).join('')}</ol>
     <div class="ht-run">
       <button id="grafloria-howto-run">▶ run the scripted checks</button>
@@ -230,9 +240,489 @@ function buildHowTo(spec) {
   setOpen(open);
 }
 
+
+/**
+ * The code drawer — DevExtreme-style framework tabs plus an ECharts-style live
+ * editor, on EVERY demo page with zero per-demo authoring:
+ *
+ *  - The JavaScript tab is the page's OWN module source (extracted from the DOM,
+ *    true by construction) in an editable pane. "Run" rebuilds the entire page
+ *    inside a sandboxed iframe with the edited source — full fidelity for all
+ *    demos, because what runs IS the page. "Reset" discards the iframe; the
+ *    original live demo underneath was never touched.
+ *  - Angular / React / Vue tabs show the verified mount dialect for the same
+ *    engine. A demo can override any tab with hand-written code via
+ *    defineDemo({ code: { angular: '...', react: '...', vue: '...' } }).
+ *  - Chrome like the nav: invisible under webdriver, so gates and goldens
+ *    never see it.
+ */
+function buildCodePanel(spec) {
+  if (navigator.webdriver) return;
+  if (document.getElementById('gf-code')) return;
+
+  const pageSource = (document.querySelector('script[type="module"]')?.textContent ?? '').replace(/^\n/, '');
+
+  // ── Framework variants: a REAL Angular implementation may exist for this
+  // demo (apps/demos-angular, baked to ../../demos-angular). When it does, the
+  // Angular tab shows its actual source files and the Angular pill swaps the
+  // running demo to it. Absent (404 / local-only serving), tabs degrade to the
+  // generic dialect samples.
+  const routeKey = location.pathname.replace(/.*\/([^/]+\/[^/]+)\.html$/, '$1');
+  // Each framework may ship a REAL implementation of this demo under
+  // ../../demos-<fw>/. The tab shows its actual source files; the pill runs it.
+  const FW_APPS = { angular: '../../demos-angular/', react: '../../demos-react/', vue: '../../demos-vue/', qwik: '../../demos-qwik/' };
+  const fwFiles = { angular: null, react: null, vue: null, qwik: null };   // [{name,text}] per fw
+  let fwFileIdx = 0;
+  const variantReady = Promise.all(Object.keys(FW_APPS).map((fw) =>
+    fetch(FW_APPS[fw] + 'sources.json')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => { fwFiles[fw] = j?.routes?.[routeKey] ?? null; })
+      .catch(() => { fwFiles[fw] = null; })
+  ));
+
+  const FW = [
+    { key: 'js',      label: 'JavaScript' },
+    { key: 'angular', label: 'Angular' },
+    { key: 'react',   label: 'React' },
+    { key: 'vue',     label: 'Vue' },
+    { key: 'qwik',    label: 'Qwik' },
+    { key: 'install', label: 'Install' },
+  ];
+
+  // A demo may ship its own dialect samples as plain-text script blocks —
+  // `<script type="text/plain" data-code="angular">…</script>` — so they stay
+  // out of the module the JavaScript tab shows. `spec.code` still wins.
+  const blockCode = (fw) => document.querySelector(`script[type="text/plain"][data-code="${fw}"]`)?.textContent?.replace(/^\n/, '') ?? undefined;
+  const samples = {
+    js: pageSource,
+    angular: spec.code?.angular ?? blockCode('angular') ?? `// npm i @grafloria/angular
+import { Component, viewChild } from '@angular/core';
+import { GrafloriaDiagramCanvas } from '@grafloria/angular';
+
+@Component({
+  standalone: true,
+  imports: [GrafloriaDiagramCanvas],
+  template: \`
+    <grafloria-diagram-canvas
+      [(nodes)]="nodes" [(edges)]="edges"
+      style="display:block; height:100%" />
+  \`,
+})
+export class DemoComponent {
+  // Use this demo's exact nodes/edges — copy them from the JavaScript tab.
+  nodes = [/* ... */];
+  edges = [/* ... */];
+
+  // Need the instance? Grab the canvas by template ref — its public methods
+  // (exportText, fitView, ...) and the engine API are identical to the
+  // JavaScript tab: one engine underneath every framework.
+  canvas = viewChild(GrafloriaDiagramCanvas);
+}`,
+    react: spec.code?.react ?? blockCode('react') ?? `// npm i @grafloria/react
+import { GrafloriaFlow } from '@grafloria/react';
+
+// Use this demo's exact nodes/edges — copy them from the JavaScript tab.
+const nodes = [/* ... */];
+const edges = [/* ... */];
+
+export function Demo() {
+  return (
+    <GrafloriaFlow
+      nodes={nodes}
+      edges={edges}
+      onInit={(instance) => {
+        // \`instance\` is the same object the JavaScript tab drives —
+        // every call there works identically here.
+      }}
+    />
+  );
+}`,
+    vue: spec.code?.vue ?? blockCode('vue') ?? `<!-- npm i @grafloria/vue -->
+<script setup>
+import { GrafloriaFlow } from '@grafloria/vue';
+import { ref } from 'vue';
+
+// Use this demo's exact nodes/edges — copy them from the JavaScript tab.
+const nodes = ref([/* ... */]);
+const edges = ref([/* ... */]);
+
+// \`instance\` from @init is the same object the JavaScript tab drives.
+const onInit = (instance) => {};
+<\/script>
+
+<template>
+  <GrafloriaFlow v-model:nodes="nodes" v-model:edges="edges" @init="onInit" />
+</template>`,
+    qwik: spec.code?.qwik ?? blockCode('qwik') ?? `// npm i @grafloria/qwik
+import { component$, $ } from '@builder.io/qwik';
+import { GrafloriaFlow, type DiagramInstance } from '@grafloria/qwik';
+
+// Use this demo's exact nodes/edges — copy them from the JavaScript tab.
+const nodes = [/* ... */];
+const edges = [/* ... */];
+
+export default component$(() => (
+  // \`instance\` from onInit$ is the same object the JavaScript tab drives.
+  <GrafloriaFlow defaultNodes={nodes} defaultEdges={edges}
+    onInit$={$((instance: DiagramInstance) => {})} />
+));`,
+    install: `# pick your dialect — one engine underneath all of them
+npm i @grafloria/element            # plain web component <grafloria-flow>
+npm i @grafloria/angular   # Angular
+npm i @grafloria/react              # React
+npm i @grafloria/vue                # Vue 3
+npm i @grafloria/qwik               # Qwik
+
+# headless (Node, workers, server-side export)
+npm i @grafloria/engine @grafloria/renderer`,
+  };
+
+  const NOTES = {
+    js: '<b>This exact code just ran on this page.</b> Edit it and press Run — the demo rebuilds with your code. <code>ctx.host</code> is the container element; <code>defineDemo</code> is gallery harness you can keep or drop.',
+    angular: '<b>Same engine, Angular dialect.</b> The mount is Angular signals + banana-boxes; every instance call from the JavaScript tab works identically here.',
+    react: '<b>Same engine, React dialect.</b> The mount is React; every instance call from the JavaScript tab works identically on the <code>onInit</code> instance.',
+    vue: '<b>Same engine, Vue dialect.</b> The mount is Vue 3; every instance call from the JavaScript tab works identically on the <code>@init</code> instance.',
+    qwik: '<b>Same engine, Qwik dialect.</b> The mount is a Qwik component; every instance call from the JavaScript tab works identically on the <code>onInit$</code> instance.',
+    install: '<b>All packages are MIT.</b> Dual CJS + ESM builds; the element registers <code>&lt;grafloria-flow&gt;</code> on import.',
+  };
+
+  const drawer = document.createElement('div');
+  drawer.id = 'gf-code';
+  drawer.innerHTML =
+    `<div class="gfc-bar" role="tablist" aria-label="Code language">` +
+    FW.map((f) => `<button class="gfc-tab" role="tab" data-tab="${f.key}">${f.label}</button>`).join('') +
+    `<span class="gfc-badge" id="gfc-badge">&#9679; this page's live source — ran in CI</span>` +
+    `<span class="gfc-actions">` +
+    `<button class="gfc-run" id="gfc-run" title="Re-run the demo with your edited code">&#9654; Run</button>` +
+    `<button class="gfc-reset" id="gfc-reset" title="Back to the live original">Reset</button>` +
+    `<button class="gfc-copy" id="gfc-copy">Copy</button>` +
+    `<button class="gfc-close" id="gfc-close" aria-label="Close">×</button>` +
+    `</span></div>` +
+    `<p class="gfc-note" id="gfc-note"></p>` +
+    `<div class="gfc-filebar" id="gfc-filebar"></div>` +
+    `<div class="gfc-body">` +
+    `<textarea class="gfc-editor" id="gfc-editor" spellcheck="false" aria-label="Demo source"></textarea>` +
+    `<pre class="gfc-view" id="gfc-view"></pre>` +
+    `<div class="gfc-monaco" id="gfc-monaco"></div>` +
+    `</div>`;
+  document.body.appendChild(drawer);
+
+  const editor = drawer.querySelector('#gfc-editor');
+  const view = drawer.querySelector('#gfc-view');
+  const note = drawer.querySelector('#gfc-note');
+  const badge = drawer.querySelector('#gfc-badge');
+  const runBtn = drawer.querySelector('#gfc-run');
+  const resetBtn = drawer.querySelector('#gfc-reset');
+  const monacoHost = drawer.querySelector('#gfc-monaco');
+  const fileBar = drawer.querySelector('#gfc-filebar');
+
+  // ── Monaco editor (progressive enhancement) ──────────────────────────────
+  // Real VS Code-grade syntax colouring + an editable JS surface. Loaded lazily
+  // from the CDN the first time the drawer opens; if it never arrives (offline,
+  // CSP), the textarea + regex highlighter below stay as the fallback.
+  const M = { editor: null, ready: null, jsValue: pageSource, lang: 'javascript', file: 0 };
+  const EXT_LANG = { ts: 'typescript', tsx: 'typescript', js: 'javascript', html: 'html', vue: 'html', css: 'css' };
+  function loadMonaco() {
+    if (M.ready) return M.ready;
+    // Shared with code-editor.js: a second loader.js on the page throws.
+    if (window.__grafloriaMonaco) return (M.ready = window.__grafloriaMonaco);
+    const CDN = 'https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs';
+    M.ready = window.__grafloriaMonaco = new Promise((resolve, reject) => {
+      window.MonacoEnvironment = {
+        // A BLOB worker (page origin) can importScripts the CDN's CORS-enabled
+        // worker; a data: worker has an opaque origin and is blocked.
+        getWorkerUrl: () => URL.createObjectURL(new Blob(
+          [`self.MonacoEnvironment={baseUrl:'${CDN}/'};importScripts('${CDN}/base/worker/workerMain.js');`],
+          { type: 'application/javascript' })),
+      };
+      const s = document.createElement('script');
+      s.src = `${CDN}/loader.js`;
+      s.onload = () => {
+        window.require.config({ paths: { vs: CDN } });
+        window.require(['vs/editor/editor.main'], () => resolve(window.monaco), reject);
+      };
+      s.onerror = reject;
+      document.head.appendChild(s);
+    }).catch(() => null);
+    return M.ready;
+  }
+  function mountMonaco(monaco) {
+    if (M.editor || !monaco) return;
+    // We want rich SYNTAX COLOURING + a light editable surface, not a full IDE.
+    // Turn off the worker-backed language services (IntelliSense, validation) so
+    // no cross-origin worker is ever spawned — that keeps the console clean and
+    // avoids a CDN worker dependency. Tokenizer colouring runs on the main thread.
+    try {
+      const off = { completionItems: false, hovers: false, documentSymbols: false, definitions: false,
+        references: false, documentHighlights: false, rename: false, diagnostics: false, codeActions: false,
+        signatureHelp: false, onTypeFormattingEdits: false, documentRangeFormattingEdits: false, inlayHints: false };
+      const t = monaco.languages.typescript;
+      for (const d of [t.typescriptDefaults, t.javascriptDefaults]) {
+        d.setDiagnosticsOptions({ noSemanticValidation: true, noSyntaxValidation: true, noSuggestionDiagnostics: true });
+        d.setModeConfiguration(off);
+      }
+      monaco.languages.html?.htmlDefaults?.setModeConfiguration?.(off);
+      monaco.languages.css?.cssDefaults?.setModeConfiguration?.(off);
+    } catch { /* older monaco — coloring still works */ }
+    const dark = matchMedia('(prefers-color-scheme: dark)').matches;
+    M.editor = monaco.editor.create(monacoHost, {
+      value: M.jsValue, language: 'javascript', theme: dark ? 'vs-dark' : 'vs',
+      readOnly: false, minimap: { enabled: false }, fontSize: 12.5, lineNumbers: 'on',
+      scrollBeyondLastLine: false, automaticLayout: true, tabSize: 2, wordWrap: 'off',
+      renderLineHighlight: 'none', padding: { top: 10 },
+    });
+    editor.style.display = 'none'; view.style.display = 'none';
+    setTab(tab); // re-render the active tab through Monaco now that it exists
+  }
+
+  // The JS source the visitor is currently editing (Monaco if mounted, else textarea).
+  const currentJs = () => (M.editor && tab === 'js' ? M.editor.getValue() : editor.value);
+  // Show text in Monaco with a language + editability; syncs the file-tab bar too.
+  const showMonaco = (text, langExt, readOnly, files, activeIdx, onPick) => {
+    const monaco = window.monaco;
+    // Set an explicit display — '' would revert to the stylesheet's `display:none`.
+    monacoHost.style.display = 'block'; editor.style.display = 'none'; view.style.display = 'none';
+    const model = M.editor.getModel();
+    if (model.getValue() !== text) M.editor.setValue(text);
+    monaco.editor.setModelLanguage(model, EXT_LANG[langExt] ?? 'plaintext');
+    M.editor.updateOptions({ readOnly });
+    fileBar.innerHTML = files
+      ? files.map((f, i) => `<button class="gfc-file${i === activeIdx ? ' on' : ''}" data-i="${i}">${escapeHtml(f.name)}</button>`).join('')
+      : '';
+    fileBar.style.display = files ? 'flex' : 'none';  // '' would revert to the stylesheet's display:none
+    if (files) fileBar.querySelectorAll('.gfc-file').forEach((b) => b.addEventListener('click', () => onPick(+b.dataset.i)));
+  };
+
+  let tab = 'js';
+  const setTab = (t) => {
+    tab = t;
+    drawer.querySelectorAll('.gfc-tab').forEach((b) => b.classList.toggle('on', b.dataset.tab === t));
+    const editable = t === 'js';
+    const realFw = fwFiles[t];
+    badge.style.display = editable ? '' : 'none';
+    runBtn.style.display = editable ? '' : 'none';
+    resetBtn.style.display = editable ? '' : 'none';
+
+    if (M.editor) {
+      // Monaco path.
+      if (editable) {
+        showMonaco(M.jsValue, 'js', false, null, 0);
+      } else if (realFw) {
+        if (M.file >= realFw.length) M.file = 0;
+        const f = realFw[M.file];
+        showMonaco(f.text, f.name.split('.').pop(), true, realFw, M.file, (i) => { M.file = i; setTab(t); });
+      } else {
+        // EXT_LANG is keyed by file EXTENSION: 'ts' → TypeScript colouring for
+        // the Angular / React samples, 'vue' → HTML for the SFC. Passing a
+        // language NAME here fell through to plaintext — every framework tab
+        // painted black while the JS tab was coloured (live report).
+        showMonaco(samples[t], t === 'install' ? 'js' : t === 'vue' ? 'vue' : 'ts', true, null, 0);
+      }
+    } else {
+      // Fallback: textarea (JS) / highlighted <pre> (frameworks).
+      editor.style.display = editable ? '' : 'none';
+      view.style.display = editable ? 'none' : '';
+      if (editable) { if (!editor.value) editor.value = samples.js; }
+      else if (realFw) renderFwFiles(t);
+      else view.innerHTML = highlight(samples[t]);
+    }
+
+    const fwLabel = { angular: 'Angular', react: 'React', vue: 'Vue', qwik: 'Qwik' }[t];
+    note.innerHTML = realFw
+      ? '<b>This is a real ' + fwLabel + ' app.</b> The files below are the actual compiled-and-gated source of the ' + fwLabel + ' implementation running when the ' + fwLabel + ' pill is active. <a href="' + FW_APPS[t] + 'index.html#/' + routeKey + '" target="_blank" rel="noopener">Open it standalone ↗</a>'
+      : NOTES[t];
+    document.querySelectorAll('.fw-switch [data-fw]').forEach((p) => p.classList.toggle('on', p.dataset.fw === t));
+  };
+
+  // Keep the edited JS in sync as the user types, so a tab switch never loses it.
+  const saveJs = () => { if (M.editor && tab === 'js') M.jsValue = M.editor.getValue(); };
+
+  const setOpen = (open) => {
+    document.body.classList.toggle('code-open', open);
+    if (open) loadMonaco().then((m) => { if (m) { mountMonaco(m); requestAnimationFrame(() => M.editor?.layout()); } });
+  };
+
+  drawer.querySelectorAll('.gfc-tab').forEach((b) => b.addEventListener('click', () => { saveJs(); setTab(b.dataset.tab); }));
+  drawer.querySelector('#gfc-close').addEventListener('click', () => setOpen(false));
+  drawer.querySelector('#gfc-copy').addEventListener('click', async () => {
+    const text = tab === 'js' ? currentJs() : (fwFiles[tab] ? fwFiles[tab][M.file].text : samples[tab]);
+    try { await navigator.clipboard.writeText(text); } catch { /* clipboard denied */ }
+    const c = drawer.querySelector('#gfc-copy');
+    c.textContent = 'Copied'; setTimeout(() => { c.textContent = 'Copy'; }, 1200);
+  });
+
+  // Tab key inserts two spaces instead of leaving the textarea (fallback only).
+  editor.addEventListener('keydown', (e) => {
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      const { selectionStart: a, selectionEnd: b, value } = editor;
+      editor.value = value.slice(0, a) + '  ' + value.slice(b);
+      editor.selectionStart = editor.selectionEnd = a + 2;
+    }
+  });
+
+  // Multi-file view for a real framework variant — FALLBACK (no Monaco): file
+  // sub-tabs over one highlighted <pre>.
+  const renderFwFiles = (fw) => {
+    const files = fwFiles[fw];
+    if (fwFileIdx >= files.length) fwFileIdx = 0;
+    const tabs = files.map((f, i) =>
+      `<button class="gfc-file${i === fwFileIdx ? ' on' : ''}" data-i="${i}">${escapeHtml(f.name)}</button>`).join('');
+    view.innerHTML = `<div class="gfc-files">${tabs}</div>` +
+      `<div class="gfc-filebody">${highlight(files[fwFileIdx].text)}</div>`;
+    view.querySelectorAll('.gfc-file').forEach((b) =>
+      b.addEventListener('click', () => { fwFileIdx = +b.dataset.i; renderFwFiles(fw); }));
+  };
+
+  // The variant overlay: a framework implementation RUNNING over the JS demo.
+  let variantOverlay = null;
+  let variantFw = null;
+  const showVariant = (fw) => {
+    if (!fwFiles[fw]) return;
+    if (variantOverlay && variantFw !== fw) { variantOverlay.remove(); variantOverlay = null; }
+    variantFw = fw;
+    const label = { angular: 'Angular', react: 'React', vue: 'Vue', qwik: 'Qwik' }[fw];
+    if (!variantOverlay) {
+      variantOverlay = document.createElement('div');
+      variantOverlay.className = 'gfc-overlay gfc-variant';
+      variantOverlay.innerHTML =
+        `<div class="gfc-variant-banner">${label} implementation — live. Switch to <b>JS</b> to return.</div>` +
+        `<iframe class="gfc-frame" title="${label} implementation" src="${FW_APPS[fw]}index.html#/${routeKey}"></iframe>`;
+      document.body.appendChild(variantOverlay);
+    }
+    positionOverlays();
+    document.body.classList.add('gfc-variant-on');
+  };
+  const hideVariant = () => {
+    variantOverlay?.remove(); variantOverlay = null;
+    document.body.classList.remove('gfc-variant-on');
+  };
+
+  // ── Run: rebuild the page in an iframe with the edited source ──
+  let overlay = null;
+  const positionOverlays = () => {
+    const head = document.getElementById('demo-head');
+    const top = (head ? head.getBoundingClientRect().bottom : 0) + 'px';
+    if (overlay) overlay.style.top = top;
+    if (variantOverlay) variantOverlay.style.top = top;
+  };
+  const positionOverlay = positionOverlays;
+
+  // A classic script injected FIRST into the preview iframe: it registers global
+  // error handlers before the edited module parses, so a syntax error (which
+  // dispatches a window 'error' event) or a runtime throw / rejected promise is
+  // relayed to this drawer instead of dying silently in the iframe's console.
+  const ERR_CATCHER =
+    `<script>(function(){function s(m){try{parent.postMessage({__gfErr:1,msg:String(m||'Unknown error')},'*');}catch(e){}}` +
+    `addEventListener('error',function(e){s(e.message||(e.error&&e.error.stack)||'Script error');});` +
+    `addEventListener('unhandledrejection',function(e){var r=e.reason;s((r&&(r.stack||r.message))||r||'Unhandled promise rejection');});})();<\/script>`;
+
+  const showRunError = (msg) => {
+    if (!overlay) return;
+    let el = overlay.querySelector('.gfc-err');
+    if (!el) { el = document.createElement('div'); el.className = 'gfc-err'; overlay.appendChild(el); }
+    el.innerHTML = `<b>Your code didn't run.</b> <span></span>` +
+      `<button class="gfc-err-x" aria-label="Dismiss">×</button>`;
+    el.querySelector('span').textContent = msg;
+    el.querySelector('.gfc-err-x').onclick = () => el.remove();
+  };
+  // The preview iframe (srcdoc) inherits this page's origin, so postMessage is same-origin.
+  addEventListener('message', (e) => { if (e.data && e.data.__gfErr) showRunError(e.data.msg); });
+
+  runBtn.addEventListener('click', async () => {
+    runBtn.textContent = '… running'; runBtn.disabled = true;
+    try {
+      const html = await (await fetch(location.pathname)).text();
+      const edited = currentJs().replace(/<\/script/gi, '<\\/script');
+      const at = html.indexOf('<script type="module">');
+      const end = html.indexOf('</' + 'script>', at);
+      const rebuilt =
+        `<base href="${location.href}">` +
+        `<script>window.__GRAFLORIA_EMBED = 1<\/script>` + ERR_CATCHER +
+        html.slice(0, at) + '<script type="module">\n' + edited + '\n' + html.slice(end);
+      if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.className = 'gfc-overlay';
+        overlay.innerHTML = '<iframe class="gfc-frame" title="Your edited demo"></iframe>';
+        document.body.appendChild(overlay);
+      }
+      overlay.querySelector('.gfc-err')?.remove();  // clear last run's error before retrying
+      overlay.querySelector('iframe').srcdoc = rebuilt;
+      positionOverlay();
+      document.body.classList.add('gfc-running');
+    } finally {
+      runBtn.textContent = '\u25B6 Run'; runBtn.disabled = false;
+    }
+  });
+  resetBtn.addEventListener('click', () => {
+    overlay?.remove(); overlay = null;
+    document.body.classList.remove('gfc-running');
+    M.jsValue = samples.js; editor.value = samples.js;
+    if (M.editor && tab === 'js') M.editor.setValue(samples.js);
+  });
+  addEventListener('resize', positionOverlays);
+
+  // Header wiring: the Code toggle + the framework pills.
+  document.getElementById('gf-code-toggle')?.addEventListener('click', () => {
+    setOpen(!document.body.classList.contains('code-open'));
+  });
+  document.querySelectorAll('.fw-switch [data-fw]').forEach((p) =>
+    p.addEventListener('click', async () => {
+      await variantReady;
+      const fw = p.dataset.fw;
+      fwFileIdx = 0;
+      setTab(fw);
+      setOpen(true);
+      if (fw !== 'js' && fwFiles[fw]) showVariant(fw);
+      else hideVariant();
+      try { localStorage.setItem('grafloria-fw', fw); } catch { /* private mode */ }
+    })
+  );
+  // Refresh the current tab once discovery lands, if a real variant appeared.
+  variantReady.then(() => { if (tab !== 'js' && fwFiles[tab]) setTab(tab); });
+
+  let fw = 'js';
+  try { fw = localStorage.getItem('grafloria-fw') || 'js'; } catch { /* private mode */ }
+  setTab(FW.some((f) => f.key === fw) ? fw : 'js');
+  // The drawer always starts CLOSED. It used to restore its last state, so
+  // opening it once made every subsequent demo load with the canvas already
+  // squeezed between the nav, the how-to panel and the drawer — the demo is the
+  // point of the page, and it should be what you see first. The `</> Code`
+  // button (and the framework pills) open it on demand.
+  setOpen(false);
+}
+
+/**
+ * Tiny single-pass highlighter for the read-only tabs — zero deps. ONE pass
+ * over the RAW source, escaping per token: multi-pass replace() re-scans its
+ * own injected markup (the `class` in `<span class=…>` matched the keyword
+ * rule and shredded the HTML — caught by screenshot, not by tests).
+ */
+function highlight(src) {
+  const esc = (x) => String(x).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+  const re = /(\/\/[^\n]*|<!--[\s\S]*?-->|(?:^|\n)#[^\n]*)|('(?:[^'\\\n]|\\.)*')|\b(import|from|export|const|let|var|function|return|async|await|new|class|extends|if|else|for|of|this)\b/g;
+  let out = '', last = 0, m;
+  while ((m = re.exec(src))) {
+    out += esc(src.slice(last, m.index));
+    if (m[1]) {
+      const nl = m[1].startsWith('\n') ? '\n' : '';
+      out += nl + '<span class="tk-c">' + esc(nl ? m[1].slice(1) : m[1]) + '</span>';
+    } else if (m[2]) {
+      out += '<span class="tk-s">' + esc(m[2]) + '</span>';
+    } else {
+      out += '<span class="tk-k">' + m[3] + '</span>';
+    }
+    last = re.lastIndex;
+  }
+  return out + esc(src.slice(last));
+}
+
 export function defineDemo(spec) {
   const boot = async () => {
-    buildNav(); // fire-and-forget: the menu must not block the demo booting
+    // EMBED MODE: the code drawer's Run rebuilds this page inside an iframe with
+    // the visitor's edited source. The iframe run gets NO chrome — just the demo.
+    const embedded = !!window.__GRAFLORIA_EMBED;
+    if (!embedded) buildNav(); // fire-and-forget: the menu must not block the demo booting
     const host = document.getElementById('canvas');
     const ctx = {
       host,
@@ -243,19 +733,37 @@ export function defineDemo(spec) {
     // Header. Written by the shell so every page carries the same brand and the
     // same claim in the same place.
     const head = document.getElementById('demo-head');
-    if (head) {
+    if (embedded) {
+      // The iframe run: no header, full-height canvas.
+      if (head) head.remove();
+      document.body.classList.add('gf-embed');
+    } else if (head) {
+      // The fw pills + Code toggle are wired by buildCodePanel, which never
+      // builds under webdriver — so under webdriver they must not RENDER
+      // either. interaction-run's DEAD-BUTTON audit caught exactly this:
+      // five chrome buttons with no observable effect. Chrome renders only
+      // where its wiring does.
+      const chrome = navigator.webdriver ? '' : `
+          <div class="fw-switch" role="tablist" aria-label="Framework">
+            <button data-fw="js" role="tab">JS</button>
+            <button data-fw="angular" role="tab">Angular</button>
+            <button data-fw="react" role="tab">React</button>
+            <button data-fw="vue" role="tab">Vue</button>
+            <button data-fw="qwik" role="tab">Qwik</button>
+          </div>`;
+      const codeBtn = navigator.webdriver ? '' : `
+            <button class="code-toggle" id="gf-code-toggle">&lsaquo;/&rsaquo; Code</button>`;
       head.innerHTML = `
         <div class="brand-row">
           <a class="brand" href="../index.html"><img src="../shell/logo.svg" alt=""><span>grafloria</span></a>
-          <span class="crumb">demos</span>
-          <nav class="head-links">
+          <span class="crumb">demos</span>${chrome}
+          <nav class="head-links">${codeBtn}
             <a href="../index.html">← All demos</a>
             <a href="https://github.com/grafloria/grafloria">GitHub</a>
             <a href="https://grafloria.com">grafloria.com</a>
           </nav>
         </div>
-        <h1>${escapeHtml(spec.name)}</h1>
-        <p class="blurb">${escapeHtml(spec.blurb)}</p>`;
+        <h1>${escapeHtml(spec.name)}</h1>`;
     }
 
     // Reserve the CHROME's layout space BEFORE the page fits itself: buildNav
@@ -263,12 +771,13 @@ export function defineDemo(spec) {
     // were framed for the full width — then the drawer pushed in and clipped
     // the right edge (live audit: swimlanes' ticket, dynamic-layouting's n5,
     // a racy auto-layout boot). Same store, same default as buildNav's setOpen.
-    if (!navigator.webdriver) {
+    if (!navigator.webdriver && !embedded) {
       let navOpen = null;
       try { navOpen = localStorage.getItem('grafloria-nav-open'); } catch { /* private mode */ }
       document.body.classList.toggle('nav-open', navOpen === null ? window.innerWidth >= 1100 : navOpen === '1');
     }
-    buildHowTo(spec); // right-side "how to test" panel (skipped under webdriver)
+    if (!embedded) buildHowTo(spec); // right-side "how to test" panel (skipped under webdriver)
+    if (!embedded) buildCodePanel(spec); // bottom code drawer (skipped under webdriver)
 
     await spec.setup(ctx);
 

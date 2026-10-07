@@ -141,6 +141,23 @@ export type { TokenBridge } from '@grafloria/renderer';
 export { portTypeRegistry, arePortDataTypesCompatible, portTypeColor } from '@grafloria/engine';
 export type { PortDataTypeDefinition } from '@grafloria/engine';
 
+// Stencils & shape masters — the Visio-style palette surface. Named here (not
+// left to the `export *` below) because this IS the documented way to browse and
+// register shapes: listStencils() feeds a palette, registerStencils() puts every
+// master behind engine.templateRegistry for NodeFactory to stamp.
+export {
+  listStencils,
+  builtInStencils,
+  getStencil,
+  registerStencils,
+  registerGeneratedTemplates,
+  generatedTemplates,
+  TemplateRegistry,
+  NodeFactory,
+  registerTemplateLibrary,
+} from '@grafloria/engine';
+export type { Stencil, NodeTemplate } from '@grafloria/engine';
+
 // Named style classes — the `named-class` layer of the cascade. The cascade read
 // this registry on every frame; nothing could WRITE to it.
 export {
@@ -573,6 +590,23 @@ export {
   bindCardEditing,
   matchColumns,
   rowIndexFromY,
+  // Live join guidance (query-builder): score every other table's columns
+  // against a connection drag's source column and tint the kit rows by fit.
+  scoreMatch,
+  matchTier,
+  assignTiers,
+  singularize,
+  bindJoinGuidance,
+  ensureJoinGuidanceStyles,
+  JOIN_GUIDANCE_STYLE_ID,
+} from './lib/diagram-kit';
+export type {
+  JoinColumn,
+  JoinEnd,
+  MatchTier,
+  JoinGuidanceApi,
+  JoinGuidanceOptions,
+  JoinGuidanceHandle,
 } from './lib/diagram-kit';
 export type {
   ErColumn,
@@ -619,6 +653,19 @@ export type { HandleApi } from './lib/diagram-kit';
 // ===========================================================================
 export {
   bindDashboardGrid,
+  paintTabStrip,
+  tabStripReserve,
+  tabStripKey,
+  TAB_STRIP_HEIGHT,
+  TAB_DRAG_THRESHOLD,
+  normalizeCaption,
+  captionReserve,
+  captionBandHeight,
+  paintCaptionBand,
+  CAPTION_HEIGHT,
+  CAPTION_HEIGHT_SUBTITLE,
+  CAPTION_HEIGHT_TIGHT,
+  CAPTION_PASS_THROUGH,
   rowHeightFor,
   boardHeightFor,
   columnUnitFor,
@@ -630,6 +677,7 @@ export {
   buildCommitCommands,
   ensureDashboardKitStyles,
   DASHBOARD_KIT_STYLE_ID,
+  DASHBOARD_KIT_CSS,
   // The DATA-FIRST authoring API — the erDiagram()/umlDiagram() equivalent.
   dashboard,
   // …and the built-in renderers behind `kind`, so a dashboard is useful with
@@ -655,9 +703,17 @@ export type {
   DashboardOptions,
   DashboardSpec,
   DashboardSnapshot,
+  DragHandleOption,
+  DragGripOptions,
   DashboardHandle,
   DashboardViewSpec,
   DashboardWidgetSpec,
+  SectionCaption,
+  SectionCaptionOptions,
+  TabsOptions,
+  TabPage,
+  SectionCaptionAction,
+  SectionCaptionFont,
   WidgetHandle,
   WidgetRenderer,
   KpiWidgetData,
@@ -668,6 +724,18 @@ export type {
   FunnelWidgetData,
   TableWidgetData,
 } from './lib/dashboard-kit';
+
+// The stencil kit — a Visio-style palette that drags shape masters onto the
+// canvas (T6/T7). Pairs with listStencils()/registerStencils() above.
+export { bindStencilPalette, bindShapeDataPanel, ensureStencilKitStyles } from './lib/stencil-kit';
+export type {
+  StencilPaletteApi,
+  StencilPaletteOptions,
+  StencilPaletteHandle,
+  ShapeDataPanelApi,
+  ShapeDataPanelOptions,
+  ShapeDataPanelHandle,
+} from './lib/stencil-kit';
 
 /* ==========================================================================
  * PHASE 0 — THE INVERSION.
