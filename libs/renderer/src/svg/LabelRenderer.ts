@@ -16,12 +16,22 @@
 import { linkLabelPosition, type LinkLabel, type LinkModel, type Point } from '@grafloria/engine';
 import type { VNode } from '../types/vnode.types';
 import type { Theme } from '../types/theme.types';
-import { renderTextBlock } from './text-block';
+import { renderTextBlock, wrapText } from './text-block';
+import { labelMeasureFor } from './text-measure';
+import { THEME_VARS } from '../themes/theme-vars';
 import { getLabelTemplate, htmlLabelVNode, type LabelTemplateContext } from './edge-templates';
+
+/** CSS-mode defaults: the theme variables a label's text and chip are painted with. */
+export const LINK_LABEL_COLOR_VAR = `var(${THEME_VARS['linkLabel.color'].cssVar})`;
+export const LINK_LABEL_BACKGROUND_VAR = `var(${THEME_VARS['linkLabel.background'].cssVar})`;
+
+const isCssVar = (paint: string | undefined): paint is string => typeof paint === 'string' && paint.trim().startsWith('var(');
 
 /** Default box for an HTML / template label (a `foreignObject` needs a size). */
 export const DEFAULT_HTML_LABEL_WIDTH = 120;
 export const DEFAULT_HTML_LABEL_HEIGHT = 28;
+/** renderTextBlock's line height, as a multiple of the font size. */
+const TEXT_LINE_HEIGHT = 1.2;
 
 /** Extra, per-frame context — none of it belongs on the persisted model. */
 export interface LabelRenderContext {
@@ -32,6 +42,40 @@ export interface LabelRenderContext {
    */
   offset?: Point;
   theme?: Theme;
+  /**
+   * The renderer is in CSS mode: theme DEFAULTS are written as
+   * `var(--grafloria-link-label-color)` / `var(--grafloria-link-label-background)`
+   * (inline style — a presentation attribute cannot hold `var()`), so one
+   * rendered SVG follows whichever theme's variable block the page carries.
+   * Off (programmatic / Canvas), they are the theme's literals.
+   */
+  cssMode?: boolean;
+  /**
+   * The line AS PAINTED, when that is not `link.points`: a hand-bent right-angle
+   * line stores its bends and is drawn with the jogs between them, so a label
+   * placed on the stored points sat off the drawn line. The renderer passes the
+   * painted polyline; the label is placed (and turned) along it.
+   */
+  path?: ReadonlyArray<Point>;
+}
+
+/** The point `t` of the way along a polyline (by length) and the direction of the run it lands on. */
+function alongPolyline(pts: ReadonlyArray<Point>, t: number): { point: Point; angle: number } | null {
+  if (pts.length < 2) return null;
+  let total = 0;
+  for (let i = 0; i < pts.length - 1; i++) total += Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y);
+  if (total <= 0) return { point: { ...pts[0] }, angle: 0 };
+  let remaining = total * Math.max(0, Math.min(1, t));
+  for (let i = 0; i < pts.length - 1; i++) {
+    const a = pts[i], b = pts[i + 1];
+    const len = Math.hypot(b.x - a.x, b.y - a.y);
+    if (len > 0 && (remaining <= len || i === pts.length - 2)) {
+      const u = Math.min(1, remaining / len);
+      return { point: { x: a.x + (b.x - a.x) * u, y: a.y + (b.y - a.y) * u }, angle: (Math.atan2(b.y - a.y, b.x - a.x) * 180) / Math.PI };
+    }
+    remaining -= len;
+  }
+  return { point: { ...pts[pts.length - 1] }, angle: 0 };
 }
 
 /**
@@ -65,8 +109,9 @@ export class LabelRenderer {
   renderLabel(label: LinkLabel, link: LinkModel, context: LabelRenderContext = {}): VNode | null {
     const position = linkLabelPosition(label);
 
-    // Get position on path
-    const point = link.getPointAtPosition(position);
+    // Get position on path — the painted one when the renderer handed it over
+    const along = context.path ? alongPolyline(context.path, position) : null;
+    const point = along ? along.point : link.getPointAtPosition(position);
     if (!point) {
       return null; // No valid position
     }
@@ -77,7 +122,7 @@ export class LabelRenderer {
     const finalY = point.y + offset.y;
 
     // Calculate rotation
-    const rotation = this.resolveRotation(label, link, position);
+    const rotation = this.resolveRotation(label, link, position, along?.angle);
 
     // --- Card 5: an author TEMPLATE replaces everything below ---------------
     if (label.template) {
@@ -142,25 +187,37 @@ export class LabelRenderer {
     // Get style properties
     const fontSize = label.style?.fontSize ?? this.defaultFontSize;
     const fontFamily = label.style?.fontFamily;
-    const color = label.style?.color ?? this.defaultColor;
+    const theme = context.theme as Theme | undefined;
+    // THE THEME'S DEFAULTS, when the label sets no colour of its own. The text
+    // used to fall back to a hard-coded black while the chip below followed the
+    // theme — black on the dark theme's chip, 1.43:1. Both now come from the
+    // theme: its ink and its canvas surface. In CSS mode they are the theme's
+    // VARIABLES (emitted as inline style below), so one server-rendered SVG
+    // follows the page's theme; without a theme (the bare public API) the old
+    // black default stands.
+    const cssDefaults = !!context.cssMode && !!theme;
+    const color =
+      label.style?.color ?? (cssDefaults ? LINK_LABEL_COLOR_VAR : (theme?.colors?.text?.primary as string | undefined) ?? this.defaultColor);
     // A label rides ON the stroke — without a chip the line strikes straight
     // through the text (the screenshot audit caught exactly that). Default to
     // the theme's canvas surface so the chip reads as "the line passes behind";
     // `background: 'none'` opts back out.
-    const themedSurface = (context.theme as Theme | undefined)?.colors.background.surface;
+    const themedSurface = theme ? (cssDefaults ? LINK_LABEL_BACKGROUND_VAR : (theme.colors?.background?.surface as string | undefined)) : undefined;
     const rawBackground = label.style?.background ?? themedSurface;
     const background = rawBackground === 'none' ? undefined : rawBackground;
     const padding = label.style?.padding ?? this.defaultPadding;
     const borderRadius = label.style?.borderRadius ?? 3;
+    // A diagram an import sized to MEASURED text measures its labels the same way.
+    const measure = this.measureFor(label, link, fontSize, theme);
 
     // Build children array
     const children: VNode[] = [];
 
     // Add background if specified
     if (background) {
-      // Estimate text dimensions for background
-      const textWidth = this.estimateTextWidth(label.text, fontSize);
-      const textHeight = fontSize;
+      // Estimate text dimensions for background — the block's own lines, so a
+      // wrapped label's chip holds every line, not one line its full length.
+      const { width: textWidth, height: textHeight } = this.textBlockSize(label, fontSize, measure);
 
       const bgRect: VNode = {
         type: 'rect',
@@ -169,7 +226,9 @@ export class LabelRenderer {
           y: -textHeight / 2 - padding,
           width: textWidth + padding * 2,
           height: textHeight + padding * 2,
-          fill: background,
+          // A `var()` paint must be inline style: as an attribute it is invalid
+          // and the chip would paint black.
+          ...(isCssVar(background) ? { style: { fill: background } } : { fill: background }),
           stroke: label.style?.border,
           rx: borderRadius,
           className: 'link-label-bg'
@@ -179,7 +238,7 @@ export class LabelRenderer {
     }
 
     // Build text element
-    const textVNode = this.renderText(label, fontSize, fontFamily, color);
+    const textVNode = this.renderText(label, fontSize, fontFamily, color, measure);
     children.push(textVNode);
 
     // Return group container
@@ -200,7 +259,7 @@ export class LabelRenderer {
    * against; HTML/template labels declare their own, and text labels are
    * measured with the same estimator the background rect already uses.
    */
-  labelBox(label: LinkLabel): { width: number; height: number } {
+  labelBox(label: LinkLabel, link?: Pick<LinkModel, 'diagram'>, theme?: Theme): { width: number; height: number } {
     if (label.html !== undefined || label.template) {
       return {
         width: label.width ?? DEFAULT_HTML_LABEL_WIDTH,
@@ -209,20 +268,51 @@ export class LabelRenderer {
     }
     const fontSize = label.style?.fontSize ?? this.defaultFontSize;
     const padding = label.style?.padding ?? this.defaultPadding;
-    return {
-      width: this.estimateTextWidth(label.text, fontSize) + padding * 2,
-      height: fontSize + padding * 2,
-    };
+    // The theme's face, as renderLabel draws it: a measured label wraps by it.
+    const text = this.textBlockSize(label, fontSize, link ? this.measureFor(label, link, fontSize, theme) : undefined);
+    return { width: text.width + padding * 2, height: text.height + padding * 2 };
+  }
+
+  /** The canvas measure for a label of a MEASURED diagram (svg/text-measure.ts), else none. */
+  private measureFor(
+    label: LinkLabel,
+    link: Pick<LinkModel, 'diagram'>,
+    fontSize: number,
+    theme?: Theme
+  ): ((text: string) => number) | undefined {
+    const measureAt = labelMeasureFor(link.diagram, {
+      size: fontSize,
+      family: label.style?.fontFamily ?? (theme?.typography?.fontFamily?.default as string | undefined),
+      ...(label.style?.fontWeight !== undefined ? { weight: label.style.fontWeight } : {}),
+    });
+    return measureAt ? (t) => measureAt(t) : undefined;
+  }
+
+  /**
+   * The text block's size: its widest line and its lines at the text block's
+   * 1.2 line height — the lines renderTextBlock draws (wrapped at `maxWidth`
+   * when `textWrap`, else at hard breaks only). One line keeps the historical
+   * height of one font size.
+   */
+  private textBlockSize(
+    label: LinkLabel,
+    fontSize: number,
+    measure: (text: string) => number = (t) => this.estimateTextWidth(t, fontSize)
+  ): { width: number; height: number } {
+    const lines = wrapText(label.text, label.textWrap ? label.maxWidth : undefined, fontSize, measure);
+    const width = Math.max(...lines.map((line) => measure(line)));
+    return { width, height: lines.length === 1 ? fontSize : lines.length * fontSize * TEXT_LINE_HEIGHT };
   }
 
   /** Resolve `rotation: 'auto' | number` against the path, honouring keepUpright. */
   private resolveRotation(
     label: LinkLabel,
     link: LinkModel,
-    position: number
+    position: number,
+    paintedAngle?: number
   ): number | undefined {
     if (label.rotation === 'auto') {
-      const angle = link.getAngleAt(position);
+      const angle = paintedAngle ?? link.getAngleAt(position);
       if (angle === null) return undefined;
 
       let rotation = angle;
@@ -267,20 +357,48 @@ export class LabelRenderer {
     label: LinkLabel,
     fontSize: number,
     fontFamily: string | undefined,
-    color: string
+    color: string,
+    measure?: (text: string) => number
   ): VNode {
-    return renderTextBlock({
+    const block = renderTextBlock({
       text: label.text,
       x: 0,
       y: 0,
       maxWidth: label.textWrap ? label.maxWidth : undefined,
+      measure,
       align: label.textAnchor ?? 'middle',
       valign: label.textBaseline ?? 'middle',
       fontSize,
       fontFamily,
-      color,
+      // LabelStyle has always declared weight, style and decoration; nothing
+      // drew them — a bold green "card number and CVV" rendered regular.
+      fontWeight: label.style?.fontWeight,
+      color: isCssVar(color) ? undefined : color,
       className: 'link-label-text',
     });
+    // Each line centred on its own baseline step, as one line is, so the block
+    // sits centred on the anchor — and on its chip — instead of riding a third
+    // of a line high.
+    for (const line of block.children ?? []) {
+      if (line && typeof line === 'object') (line as VNode).props = { ...(line as VNode).props, dominantBaseline: 'middle' };
+    }
+    // The theme's variable rides an inline style — the one place `var()` is legal.
+    if (isCssVar(color)) {
+      const props = block.props as Record<string, unknown>;
+      props['style'] = { ...((props['style'] as object) ?? {}), fill: color };
+    }
+    if (label.style?.fontStyle || label.style?.textDecoration) {
+      const props = block.props as Record<string, unknown>;
+      if (label.style.fontStyle) props['fontStyle'] = label.style.fontStyle;
+      if (label.style.textDecoration) props['textDecoration'] = label.style.textDecoration;
+    }
+    // The label's own family as an INLINE style: an attribute loses to the
+    // stylesheet's `.link-label-text` rule.
+    if (fontFamily) {
+      const props = block.props as Record<string, unknown>;
+      props['style'] = { ...((props['style'] as object) ?? {}), fontFamily };
+    }
+    return block;
   }
 
   /**

@@ -51,6 +51,18 @@ function demoPages(dir = root, out = []) {
 const filter = process.argv[2];
 const pages = demoPages().filter((p) => !filter || relative(root, p).startsWith(filter));
 
+// A run over nothing is not a pass. Without this, a typo'd category ("nods")
+// drove zero demos, executed zero checks, printed a green summary line and
+// exited 0 — the most flattering possible result for the least possible work.
+if (pages.length === 0) {
+  console.error(
+    filter
+      ? `interaction: no demos matched "${filter}" — nothing was tested, which is not the same as nothing being wrong`
+      : `interaction: no demo pages found under ${root} — did demos/build.mjs run?`
+  );
+  process.exit(1);
+}
+
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json', '.svg': 'image/svg+xml' };
 const server = createServer((req, res) => {
   const url = decodeURIComponent((req.url || '/').split('?')[0]);
@@ -236,8 +248,11 @@ const IN_PAGE = () => {
     // smoothly TRAIL the cursor while every model number stayed perfect. Detect
     // it coordinate-agnostically — after the pointer STOPS, an eased transform
     // keeps sliding toward the model for the transition's duration, so the
-    // painted rect drifts while the model is static. (Physics/constraint demos
-    // whose MODEL keeps settling after release can't isolate easing → skipped.)
+    // painted rect drifts while the model is static. Measured while the pointer
+    // is still HELD: trailing the cursor is a drag bug, while a drop that
+    // settles into its slot after the release is a design (a Kanban list's
+    // card lands that way). (Physics/constraint demos whose MODEL keeps
+    // settling can't isolate easing → skipped.)
     const dragNode = model.getNodes().find((n) => n.behavior?.draggable !== false && !n.state?.locked);
     const gEl = dragNode && (host.querySelector(`[data-node-id="${dragNode.id}"]`) || host.querySelector(`[data-vnode-key="node-${dragNode.id}"]`));
     if (!dragNode || !gEl) out.skipped.push('RENDER-TRACK (no draggable node element)');
@@ -253,11 +268,12 @@ const IN_PAGE = () => {
       fire('pointermove', cx, cy); fire('pointerdown', cx, cy);
       fire('pointermove', cx + 8, cy); fire('pointermove', cx + 220, cy);
       const nodeMoved = Math.abs(dragNode.position.x - p0);
-      fire('pointerup', cx + 220, cy); await raf2();
-      // Right after release, then again after a beat with NO input.
+      await raf2();
+      // The pointer has STOPPED but is still held: now, then after a beat with NO input.
       const paintA = paintedCentre(), modelA = dragNode.position.x;
       await new Promise((r) => setTimeout(r, 260));
       const paintB = paintedCentre(), modelB = dragNode.position.x;
+      fire('pointerup', cx + 220, cy); await raf2();
       const modelDrift = Math.abs(modelB - modelA);
       const paintDrift = Math.hypot(paintB.x - paintA.x, paintB.y - paintA.y);
       if (nodeMoved < 20) out.skipped.push(`RENDER-TRACK (drag did not move the node: ${Math.round(nodeMoved)}px)`);
@@ -467,6 +483,14 @@ const IN_PAGE = () => {
           if (c.x < r.left + 5 || c.y < r.top + 5 || c.x > r.left + r.width - 5 || c.y > r.top + r.height - 5) continue;
           fire('pointermove', c.x, c.y); await raf2(); inst.renderNow(); await raf2();
           if (!n.state?.hovered) continue;
+          // A port another node covers is (rightly) not drawn: if an earlier check
+          // parked something over every one of this node's ports, that is a
+          // staging miss too, not a verdict on hover visibility.
+          const anchor = (p) => {
+            const side = p.side ?? 'right';
+            return { x: wp.x + (side === 'right' ? n.size.width : side === 'left' ? 0 : n.size.width / 2), y: wp.y + (side === 'bottom' ? n.size.height : side === 'top' ? 0 : n.size.height / 2) };
+          };
+          if (typeof model.isPointCoveredAbove === 'function' && n.getPorts().every((p) => { const a = anchor(p); return model.isPointCoveredAbove(a.x, a.y, n.id); })) continue;
           staged = n; break;
         }
         if (!staged) out.skipped.push('HOVER-PORTS (no candidate node was hoverable at its centre)');
@@ -618,8 +642,15 @@ const IN_PAGE = () => {
         const dead = [];
         for (const b of buttons.slice(0, 12)) {
           // A DISABLED button is an expected no-op (execute-flow disables its
-          // bar while a run is in flight) — skip, don't judge.
-          if (b.disabled) continue;
+          // bar while a run is in flight) — skip, don't judge. So is the tab
+          // that is ALREADY selected: clicking the open page is a no-op in
+          // every tab UI there is.
+          if (b.disabled || b.getAttribute('aria-selected') === 'true') continue;
+          // Judged as a hand would meet it, at the moment of the click: an earlier
+          // button may have HIDDEN this one (the workflow editor's Read-only toggle
+          // hides its rule buttons with `visibility: hidden`, which offsetParent
+          // does not see). A button no one can see is not a dead button.
+          if (b.offsetParent === null || getComputedStyle(b).visibility !== 'visible') continue;
           let mutated = false;
           const mo = new MutationObserver(() => { mutated = true; });
           mo.observe(document.body, { childList: true, subtree: true, attributes: true, characterData: true });
@@ -724,14 +755,26 @@ for (const page of pages) {
       }
     } catch (e) { rec.skipped.push(`FOCUS-RING (harness: ${e.message})`); }
   } catch (e) { rec.error = e.message; }
+  // An uncaught exception on the page is a failure, full stop. These were being
+  // collected and then never read: `errs` appeared exactly once in this file, so
+  // a demo could throw on every gesture and still print a clean pass. Every
+  // sibling gate (gallery, save-load, mermaid-oracle, table-editing,
+  // master-sheet, variant) already asserts on this; this one just didn't.
+  //
+  // It is worse than a missed failure, because the SKIP text then explains the
+  // crash away: a throw in the ctrl+wheel branch produced "~ skip WHEEL-ANCHOR
+  // (ctrl+wheel zoom disabled here)", reporting a crash as a configuration
+  // difference.
+  rec.pageErrors = errs;
   await tab.close();
   results.push(rec);
 
   const failed = rec.checks.filter((c) => !c.ok);
-  const mark = rec.error ? '✗' : failed.length ? '✗' : '✓';
+  const mark = rec.error || failed.length || rec.pageErrors?.length ? '✗' : '✓';
   const summary = rec.error ? `harness: ${rec.error}` : rec.checks.map((c) => `${c.ok ? '·' : '✗'}${c.name}`).join(' ');
   console.log(`${mark} ${rel}   ${summary}`);
   for (const c of failed) console.log(`      ${c.name}: ${c.detail}`);
+  for (const e of rec.pageErrors ?? []) console.log(`      PAGE ERROR: ${e}`);
   // Skips are part of the contract ("skip loudly"): a check that silently
   // stopped running looks exactly like a check that passes.
   for (const s of rec.skipped) console.log(`      ~ skip ${s}`);
@@ -740,10 +783,39 @@ for (const page of pages) {
 await browser.close();
 server.close();
 
-const bad = results.filter((r) => r.error || r.checks.some((c) => !c.ok));
+// ---- THE CORPUS FLOOR --------------------------------------------------------
+// Individually, "the drag never grabbed the node" is a fair SKIP: a custom
+// hit-area or an odd placement can genuinely defeat the setup, and one demo
+// bowing out is not a verdict on the product.
+//
+// Collectively it is the opposite. Break node dragging outright — return early
+// from moveNodeDrag, or raise dragThreshold to 250px — and EVERY demo takes that
+// same skip: the executed-check count quietly fell 182 -> 146 and the gate still
+// printed a green pass and exited 0. Nothing floored it, so a total loss of
+// dragging looked exactly like eighteen unlucky setups.
+//
+// So: a skip is allowed to explain one demo, never all of them. If a drag was
+// attempted on several demos and NOT ONE of them moved a node, that is the
+// product, and the gate says so.
+const attempted = results.filter((r) =>
+  (r.skipped ?? []).some((s) => /^(DRAG-ATTACH|RENDER-TRACK) \(drag did not move the node/.test(s))
+);
+const dragWorked = results.filter((r) =>
+  r.checks.some((c) => c.name === 'DRAG-ATTACH' || c.name === 'RENDER-TRACK')
+);
+const dragCollapsed = attempted.length >= 3 && dragWorked.length === 0;
+
+const bad = results.filter((r) => r.error || r.pageErrors?.length || r.checks.some((c) => !c.ok));
 const totalChecks = results.reduce((n, r) => n + r.checks.length, 0);
 const passChecks = results.reduce((n, r) => n + r.checks.filter((c) => c.ok).length, 0);
 console.log('');
 console.log(`interaction: ${passChecks}/${totalChecks} live-gesture checks pass across ${results.length} demos`);
+
+if (dragCollapsed) {
+  console.error(
+    `\ninteraction: dragging is BROKEN — ${attempted.length} demos tried to drag a node and not one moved. ` +
+      `That is not ${attempted.length} unlucky setups, it is the product.`
+  );
+}
 if (bad.length) console.log('\nA GESTURE THAT MISBEHAVES WHILE YOU TOUCH IT is a bug no static frame can see. This is the gate.');
-process.exit(bad.length ? 1 : 0);
+process.exit(bad.length || dragCollapsed ? 1 : 0);

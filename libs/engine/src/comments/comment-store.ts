@@ -23,11 +23,57 @@ import {
   type CommentAnchor,
   type CommentMessage,
   type CommentThreadStatus,
+  type CommentRegisterTree,
   type CommentThreadView,
   type ResolvedAnchor,
   type StoredThread,
   type WorldPoint,
 } from './types';
+
+export interface AdoptCommentsOptions {
+  /**
+   * true: the loaded threads REPLACE the diagram's (a whole-document load such as
+   * `loadText`). Default false: they are MERGED in — a thread the diagram already
+   * has (the same id) keeps its live state, so a second `finalize` never resets a
+   * reply made after the load.
+   */
+  replace?: boolean;
+}
+
+/**
+ * Put a loaded document's comment threads (its `comments` field: threads, replies,
+ * anchors, status) back on a live diagram. Loads used to drop them: the document
+ * saved them, `render(fromDocument(saved))` never restored them, and the next save
+ * lost the discussion (S5, docs review v4).
+ *
+ * One whole-tree write through the `comments` setter — the model's documented
+ * landing pad for a load — so the store, the pins and op capture all see it.
+ * Returns whether anything changed.
+ */
+export function adoptComments(
+  diagram: DiagramModel,
+  tree: CommentRegisterTree | undefined,
+  options: AdoptCommentsOptions = {}
+): boolean {
+  const loaded = tree ?? {};
+  const current = diagram.comments ?? {};
+  let next: CommentRegisterTree;
+  if (options.replace) {
+    if (Object.keys(loaded).length === 0 && Object.keys(current).length === 0) return false;
+    next = deepCloneTree(loaded);
+  } else {
+    const missing = Object.keys(loaded).filter((tid) => !(tid in current));
+    if (missing.length === 0) return false;
+    next = { ...current };
+    for (const tid of missing) next[tid] = deepCloneTree({ [tid]: loaded[tid] })[tid];
+  }
+  diagram.comments = next;
+  return true;
+}
+
+function deepCloneTree(tree: CommentRegisterTree): CommentRegisterTree {
+  return JSON.parse(JSON.stringify(tree)) as CommentRegisterTree;
+}
 
 /** What a caller asks for. The store fills in the obituary (fallback point + label). */
 export type AnchorSpec =
@@ -103,10 +149,37 @@ export class CommentStore {
       for (const mid of Object.keys(t.messages ?? {})) this.notified.add(mentionKey(tid, mid));
     }
 
-    this.unsubscribe = this.diagram.on('change', ((entry: { property: string }) => {
+    const offChange = this.diagram.on('change', ((entry: { property: string }) => {
       if (entry.property !== 'comments' && !entry.property.startsWith('comments.')) return;
       this.onCommentsChanged();
     }) as never);
+
+    // C7: `attached` is DERIVED (see resolveAnchor), so deleting — or restoring — the
+    // entity a thread is anchored to changes what every listener shows without a
+    // single comment register being written. Nothing told them: a panel wired to
+    // onChange kept saying "attached" beside a deleted node. Tell them — but only
+    // when a thread is actually anchored to that entity.
+    const entityEvent = (kind: 'node' | 'link') =>
+      ((entity: { id?: string } | undefined) => {
+        if (entity?.id && this.isAnchorOf(kind, entity.id)) this.emit();
+      }) as never;
+    const offs = [
+      offChange,
+      this.diagram.on('node:removed', entityEvent('node')),
+      this.diagram.on('node:added', entityEvent('node')),
+      this.diagram.on('link:removed', entityEvent('link')),
+      this.diagram.on('link:added', entityEvent('link')),
+    ];
+    this.unsubscribe = () => offs.forEach((off) => off?.());
+  }
+
+  /** Is any thread anchored to this entity? */
+  private isAnchorOf(kind: 'node' | 'link', id: string): boolean {
+    for (const t of Object.values(this.tree())) {
+      const anchor = (t as { anchor?: CommentAnchor }).anchor;
+      if (anchor && anchor.kind === kind && anchor.id === id) return true;
+    }
+    return false;
   }
 
   // ==========================================================================
@@ -293,12 +366,10 @@ export class CommentStore {
    *      op to un-orphan the thread, from some peer that thought to look, and until then
    *      the thread sits detached beside the node it is attached to. Derived, the thread
    *      RE-ATTACHES on the very next read, with zero ops and zero code.
-   *   3. IT ASSUMES AN ANSWER THE CRDT CARD HAS NOT GIVEN YET. Card 4 is concurrently
-   *      deciding whether a remove beats a concurrent add, or whether an observed-remove
-   *      set lets the add survive. If they land on add-wins, a node this store had marked
-   *      dead comes back. Deriving the state means BOTH answers are already handled and
-   *      neither can be wrong: whatever the diagram says right now, the pin agrees with
-   *      it. That is the only way to be robust to a decision that has not been made.
+   *   3. IT WOULD DEPEND ON HOW CONCURRENT EDITS MERGE. Whether a remove beats a
+   *      concurrent add, or an observed-remove set lets the add survive, decides whether
+   *      a node this store had marked dead comes back. Deriving the state handles BOTH
+   *      answers: whatever the diagram says right now, the pin agrees with it.
    *
    * So: nothing is stored, nothing is broadcast, and `attached` is simply "is the entity
    * in the diagram, right now". The thread survives the delete BY NOT DEPENDING ON THE
@@ -410,9 +481,8 @@ export class CommentStore {
    *
    * INCOMPLETE THREADS ARE INVISIBLE, NOT BROKEN. A thread is three ops, and an
    * unreliable transport is free to deliver the reply before the head that owns it — the
-   * substrate says so out loud (causal readiness is explicitly Card 4/5's, and until they
-   * ship it, `applyOp` will happily write `comments.t1.messages.m1` into a tree with no
-   * `t1.head`). A store that crashed on that would be broken by a packet reorder; a store
+   * substrate allows it (`applyOp` will write `comments.t1.messages.m1` into a tree with
+   * no `t1.head`). A store that crashed on that would be broken by a packet reorder; a store
    * that rendered a half-thread would show a message from nobody, about nothing. So a
    * thread without a head or an anchor simply does not exist yet, and it appears — whole,
    * with every message that arrived early already in it — the moment its head lands.
@@ -547,6 +617,18 @@ export class CommentStore {
   }
 
   // ==========================================================================
+
+  /**
+   * Bring a LOADED document's threads into this store's diagram — see
+   * {@link adoptComments}. Everything adopted is history, not news: its @mentions
+   * are marked notified first, so reopening a file never notifies anyone.
+   */
+  adopt(tree: CommentRegisterTree | undefined, options: AdoptCommentsOptions = {}): boolean {
+    for (const [tid, t] of Object.entries(tree ?? {})) {
+      for (const mid of Object.keys(t?.messages ?? {})) this.notified.add(mentionKey(tid, mid));
+    }
+    return adoptComments(this.diagram, tree, options);
+  }
 
   /** Fired whenever the comment DATA or this viewer's READ STATE changes. */
   onChange(cb: () => void): Unsub {

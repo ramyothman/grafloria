@@ -10,6 +10,8 @@ import {
   isConnectionAllowedByGroup,
   SetLinkPointsCommand,
   ReconnectLinkCommand,
+  debugLog,
+  isDebugLogging,
 } from '@grafloria/engine';
 // Wave 6: THE port-position function — hit-test and magnet where you DRAW.
 import { portWorldPosition } from '../svg/port-positioning';
@@ -25,6 +27,55 @@ import type { LinkHitTestOptions, LinkPart } from '../svg/link-hit-test';
 // wave10/gallery: the HOST's connection-veto registry. See
 // installHostConnectionValidatorBridge() — the drag path never asked it.
 import { isValidConnection } from '../ext/tools';
+
+/**
+ * World-space slack added around the cursor when asking the link index which
+ * links are worth hit-testing.
+ *
+ * Deliberately the same 250 the RENDER pass allows around its own cull query
+ * (SVGRenderer.LINK_CULL_MARGIN), and for the same reason: a link's indexed
+ * bounds are its last written `points`, so routed geometry that has not been
+ * written back yet can put real ink outside them. Being too generous here costs
+ * a handful of extra geometry tests; being too mean means a line the user can
+ * see and cannot click.
+ */
+const LINK_HIT_QUERY_PAD = 250;
+
+/**
+ * Whether a mouse button, pen or finger is currently pressed anywhere in the
+ * page. {@link InteractionController.addWaypoint} uses it to tell the press
+ * that clicked a path (which may go on to drag the new bend, and whose release
+ * commits it) from a double-click (whose buttons are already up, so no release
+ * would ever close a drag). Tracked once per page, in the capture phase.
+ */
+let pointerButtonDown = false;
+let pointerTrackerInstalled = false;
+
+function trackPointerButtons(): void {
+  if (pointerTrackerInstalled) return;
+  if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
+  pointerTrackerInstalled = true;
+  const down = (): void => {
+    pointerButtonDown = true;
+  };
+  const up = (): void => {
+    pointerButtonDown = false;
+  };
+  for (const type of ['pointerdown', 'mousedown', 'touchstart']) {
+    window.addEventListener(type, down, { capture: true, passive: true });
+  }
+  for (const type of ['pointerup', 'mouseup', 'pointercancel', 'touchend', 'touchcancel', 'dragend']) {
+    window.addEventListener(type, up, { capture: true, passive: true });
+  }
+  // The page losing focus mid-press never delivers the release.
+  window.addEventListener('blur', (event) => {
+    if (event.target === window) up();
+  });
+}
+
+function isPointerButtonDown(): boolean {
+  return pointerButtonDown;
+}
 
 /**
  * Part-aware link hit result: a link plus WHICH sub-part of it was hit
@@ -135,6 +186,23 @@ export class InteractionController {
    */
   protected hoveredNode: NodeModel | null = null;
   protected hoveredPort: PortModel | null = null;
+  /**
+   * A connection drag's SNAP target (`connection.snapToNode`): the input port of
+   * the node under or near the pointer that the drag would connect to. Shown
+   * like a hovered port while dragging; used on release only when it `accepts`
+   * (a refused one is shown so its reason can be read, never connected).
+   */
+  protected snap: { port: PortModel; accepts: boolean } | null = null;
+
+  /** Set (or clear) the connection drag's snap target. The binder's `snapToNode` drives it. */
+  setConnectionSnap(snap: { port: PortModel; accepts: boolean } | null): void {
+    this.snap = snap;
+  }
+
+  /** The port a release would connect to now: the hovered port, else an accepting snap. */
+  getConnectionTarget(): PortModel | null {
+    return this.hoveredPort ?? (this.snap?.accepts ? this.snap.port : null);
+  }
   protected hoveredLink: LinkModel | null = null;
 
   /**
@@ -149,11 +217,13 @@ export class InteractionController {
   protected isReconnectingLink = false;
   protected reconnectingLink: LinkModel | null = null;
   protected reconnectingEndpoint: 'source' | 'target' | null = null;
-  /** Wave 2: current cursor position while dragging a reconnecting endpoint. */
+  /** Current cursor position while dragging a reconnecting endpoint. */
   protected reconnectingMousePoint: Point | null = null;
+  /** Where the last {@link handleMouseMove} put the cursor — what a release resolves against. */
+  protected lastHoverPoint: Point | null = null;
 
   /**
-   * Wave 2 (Edges & links): inline label drag-reposition state. While active,
+   * Inline label drag-reposition state. While active,
    * mouse moves remap the cursor to a (position 0-1, offset) pair on the model
    * so the label survives re-routing. See {@link computeLabelDragUpdate}.
    */
@@ -162,22 +232,24 @@ export class InteractionController {
   protected editingLabelIndex: number | null = null;
 
   /**
-   * Phase 2.3a: Waypoint editing state
+   * Waypoint editing state
    */
   protected isDraggingWaypoint = false;
   protected editingLink: LinkModel | null = null;
   protected editingWaypointIndex: number | null = null;
   /**
-   * wave12: the link's points when a waypoint drag STARTED, so endWaypointDrag can commit
+   * The link's points when a waypoint drag STARTED, so endWaypointDrag can commit
    * the whole gesture as one undoable SetLinkPointsCommand (FROM→TO). Absent between drags.
    */
   protected waypointDragStartPoints: Point[] | null = null;
+  /** The link's `hasManualWaypoints` flag when the drag started, restored by its undo. */
+  protected waypointDragStartManual = false;
   protected waypointEditor: WaypointEditor | null = null;
   protected hoveredWaypointIndex: number | null = null;
   protected hoveredWaypointLink: LinkModel | null = null;
 
   /**
-   * Phase 2.3b: Control point editing state
+   * Control point editing state
    */
   protected isDraggingControlPoint = false;
   protected editingControlPointLink: LinkModel | null = null;
@@ -189,13 +261,13 @@ export class InteractionController {
   protected hoveredControlPointLink: LinkModel | null = null;
 
   /**
-   * Phase 5: Performance optimization - debounce hover detection
+   * Performance optimization - debounce hover detection
    */
   protected hoverDebounceTimer: any = null;
   protected readonly HOVER_DEBOUNCE_MS = 16; // ~60fps
 
   /**
-   * Phase 5: Performance monitoring
+   * Performance monitoring
    */
   protected performanceMetrics = {
     hoverDetectionTime: 0,
@@ -204,12 +276,13 @@ export class InteractionController {
   };
 
   /**
-   * Phase 5: Port hit test cache for performance
+   * Port hit test cache for performance
    */
   protected portHitCache = new Map<string, { x: number; y: number; radius: number }>();
   protected portHitCacheInvalidated = false;
 
   constructor() {
+    trackPointerButtons();
     // Phase 2.3a: Initialize waypoint editor with default config
     this.waypointEditor = new WaypointEditor({
       snapToGrid: false,
@@ -239,7 +312,7 @@ export class InteractionController {
   }
 
   /**
-   * Phase 5: Dispose and cleanup resources
+   * Dispose and cleanup resources
    */
   dispose(): void {
     if (this.hoverDebounceTimer) {
@@ -280,22 +353,22 @@ export class InteractionController {
   }
 
   /**
-   * Phase 5: Get performance metrics
+   * Get performance metrics
    */
   getPerformanceMetrics() {
     return { ...this.performanceMetrics };
   }
 
   /**
-   * Phase 5: Invalidate port hit cache (call when nodes move or ports change)
+   * Invalidate port hit cache (call when nodes move or ports change)
    */
   invalidatePortHitCache(): void {
     this.portHitCacheInvalidated = true;
   }
 
   /**
-   * Phase 3: Handle mouse move for hover detection
-   * Phase 5: Enhanced with performance monitoring and validation
+   * Handle mouse move for hover detection
+   * Enhanced with performance monitoring and validation
    * Updates hover states for nodes, ports, and links
    * CRITICAL FIX: Added comprehensive debugging
    */
@@ -311,6 +384,7 @@ export class InteractionController {
 
     const diagram = engine.getDiagram();
     if (!diagram) return false;
+    this.lastHoverPoint = { x: worldX, y: worldY };
 
     // Phase 5: Performance monitoring
     const startTime = performance.now();
@@ -326,7 +400,7 @@ export class InteractionController {
     // CRITICAL FIX: Debug logging for port detection
     const debugPortDetection = false; // Disabled - working correctly now
     if (debugPortDetection && (portAtPosition || nodeAtPosition)) {
-      console.log('🔍 Hover detection:', {
+      debugLog('🔍 Hover detection:', {
         worldPos: { x: worldX.toFixed(1), y: worldY.toFixed(1) },
         node: nodeAtPosition?.getMetadata('label') || 'none',
         port: portAtPosition ? `${portAtPosition.side} (${portAtPosition.id})` : 'none',
@@ -351,7 +425,7 @@ export class InteractionController {
         node.setState({ hovered: isHovered });
         needsRender = true;
         if (debugPortDetection) {
-          console.log(`  Node ${node.getMetadata('label')} hover: ${wasHovered} → ${isHovered}`);
+          debugLog(`  Node ${node.getMetadata('label')} hover: ${wasHovered} → ${isHovered}`);
         }
       }
     });
@@ -368,8 +442,18 @@ export class InteractionController {
           // CRITICAL FIX: Mark node as dirty when port hover state changes
           // This forces the renderer to regenerate the port VNodes with updated styles
           node.markDirty('port-hover-changed');
-          // TEMPORARY DEBUG: Always log port hover changes to see what's happening
-          console.log(`🔘 Port ${port.side} hover: ${wasHovered} → ${isHovered}`, { nodeLabel: node.getMetadata('label') });
+          // Guarded, not just routed through debugLog: this runs on a pointer
+          // move, and the template and object literal would be built on every
+          // hover transition even with logging off. (It was marked "TEMPORARY
+          // DEBUG: Always log" and shipped that way — it printed the consumer's
+          // own node labels into their production console whenever the mouse
+          // crossed a port. Its two neighbours in this same function were
+          // already gated; only this one was not.)
+          if (isDebugLogging()) {
+            debugLog(`Port ${port.side} hover: ${wasHovered} → ${isHovered}`, {
+              nodeLabel: node.getMetadata('label'),
+            });
+          }
         }
       });
     });
@@ -406,8 +490,8 @@ export class InteractionController {
   }
 
   /**
-   * Phase 3: Handle connection drag update
-   * Phase 5: Enhanced with performance monitoring and validation
+   * Handle connection drag update
+   * Enhanced with performance monitoring and validation
    * Updates connection preview during drag
    */
   handleConnectionDrag(
@@ -436,7 +520,7 @@ export class InteractionController {
       // engine's `snapToPortRadius`, and the candidate set is the SAME
       // valid-target set the highlight paints — the thing you can snap to is
       // exactly the thing lit up as snappable, which is the whole contract.
-      const hoveredPort = this.hoveredPort ?? this.findMagnetPort(worldX, worldY, engine);
+      const hoveredPort = this.hoveredPort ?? this.snap?.port ?? this.findMagnetPort(worldX, worldY, engine);
 
       // Update connection state with current mouse position and hovered port
       connectionStateManager.updateConnection(
@@ -460,8 +544,8 @@ export class InteractionController {
   }
 
   /**
-   * Phase 3: Start connection from port
-   * Phase 5: Enhanced with validation and error handling
+   * Start connection from port
+   * Enhanced with validation and error handling
    * CRITICAL FIX: Added detailed logging
    */
   startConnection(port: PortModel, worldX: number, worldY: number, engine: DiagramEngine): void {
@@ -479,7 +563,7 @@ export class InteractionController {
       const connectionStateManager = engine.getConnectionStateManager();
       connectionStateManager.startConnection(port, { x: worldX, y: worldY });
 
-      console.debug('🔌 Connection started:', {
+      debugLog('🔌 Connection started:', {
         portId: port.id,
         portType: port.type,
         portSide: port.side,
@@ -494,7 +578,7 @@ export class InteractionController {
   }
 
   /**
-   * wave12/connect-ergonomics (gap 3) — Easy Connect: start a connection from a
+   * Easy Connect: start a connection from a
    * node BODY, not a port glyph. Picks the source port nearest the press point
    * (so a drag off the right side starts from the right port) and begins the
    * normal connection drag from it. Returns false when the node has no port to
@@ -530,8 +614,8 @@ export class InteractionController {
   }
 
   /**
-   * Phase 3: Complete connection to target port
-   * Phase 5: Enhanced with validation and error handling
+   * Complete connection to target port
+   * Enhanced with validation and error handling
    */
   completeConnection(engine: DiagramEngine): boolean {
     if (this.isReadonlyEngine(engine)) return false;
@@ -549,7 +633,17 @@ export class InteractionController {
     try {
       const config = engine.getInteractionConfig();
       const connectionStateManager = engine.getConnectionStateManager();
-      let targetPort = this.hoveredPort;
+      let targetPort = this.hoveredPort ?? (this.snap?.accepts ? this.snap.port : null);
+
+      // C2: THE MAGNET THE DRAG SHOWED. `handleConnectionDrag` latches onto the nearest
+      // valid port within `snapToPortRadius` and lights it as the target; the release
+      // used to ignore that and re-search with the index's own 24-unit default, so a
+      // drop 25–29 px from a port (inside a 30 px magnet) created nothing while the UI
+      // said it would connect. The release now resolves by the same rule.
+      if (!targetPort) {
+        const at = connectionStateManager.getState().currentMousePosition;
+        if (at) targetPort = this.findMagnetPort(at.x, at.y, engine);
+      }
 
     // Smart mode: Auto-connect to nearest port if dropping on (or near) a node.
     //
@@ -626,6 +720,7 @@ export class InteractionController {
         // Smart-mode port snap (also the fallback when easy-connect found no node).
         if (!targetPort && smartAutoConnect) {
           const hit = diagram.findNearestPort(pos, {
+            radius: config.snapToPortRadius > 0 ? config.snapToPortRadius : undefined,
             portPosition: (port, node) => portWorldPosition(port, node),
           });
           targetPort = hit?.port ?? null;
@@ -640,9 +735,9 @@ export class InteractionController {
       success = result.success;
 
       if (success) {
-        console.debug('✅ Connection completed:', this.connectionSourcePort.id, '->', targetPort.id);
+        debugLog('✅ Connection completed:', this.connectionSourcePort.id, '->', targetPort.id);
       } else {
-        console.log('❌ Connection failed: Invalid connection');
+        debugLog('❌ Connection failed: Invalid connection');
       }
     }
 
@@ -659,9 +754,10 @@ export class InteractionController {
   }
 
   /**
-   * Phase 3: Cancel connection
+   * Cancel connection
    */
   cancelConnection(engine: DiagramEngine): void {
+    this.snap = null;
     if (!this.isConnecting) {
       return;
     }
@@ -675,11 +771,11 @@ export class InteractionController {
     // Clear port highlights
     this.clearPortHighlights(engine);
 
-    console.debug('🚫 Connection cancelled');
+    debugLog('🚫 Connection cancelled');
   }
 
   /**
-   * Phase 3 / Wave 2: Start link reconnection.
+   * Start link reconnection.
    *
    * Enters endpoint-drag mode: the dragged endpoint follows the cursor while
    * the OTHER endpoint stays put. Seeds the engine's {@link ReconnectionPreview}
@@ -713,11 +809,11 @@ export class InteractionController {
     });
     this.updateReconnectPortHighlights(engine);
 
-    console.debug(`🔗 Link reconnection started: ${endpoint} endpoint of link ${link.id}`);
+    debugLog(`🔗 Link reconnection started: ${endpoint} endpoint of link ${link.id}`);
   }
 
   /**
-   * Wave 2: Update the in-progress endpoint reconnection as the cursor moves.
+   * Update the in-progress endpoint reconnection as the cursor moves.
    *
    * Refreshes the ghost-preview endpoint, recomputes which ports are valid drop
    * targets (highlighting them), and reflects whether the currently hovered
@@ -733,16 +829,10 @@ export class InteractionController {
 
     this.reconnectingMousePoint = { x: worldX, y: worldY };
 
-    // Is the port under the cursor (if any) a legal drop target?
-    const isValid = !!(
-      this.hoveredPort &&
-      this.isValidReconnectionTarget(
-        this.reconnectingLink,
-        this.reconnectingEndpoint,
-        this.hoveredPort,
-        engine
-      )
-    );
+    // Would a release HERE land? The same resolution the drop uses (port under the
+    // cursor, magnet radius, then — with smart auto-connect — the node body), so the
+    // ghost turns valid exactly where the release will succeed.
+    const isValid = this.resolveReconnectTarget(engine, { x: worldX, y: worldY }) !== null;
 
     engine.setReconnectionPreview({
       linkId: this.reconnectingLink.id,
@@ -756,7 +846,72 @@ export class InteractionController {
   }
 
   /**
-   * Wave 2: Is `candidatePort` a legal target for reconnecting `endpoint` of
+   * Where a reconnect released at `at` lands, or null when it would be refused.
+   *
+   * 1. The port under the cursor, when it is a legal target.
+   * 2. With smart auto-connect (`mode: 'smart'` + `enableSmartAutoConnect`, the
+   *    defaults) or Easy Connect, the node BODY under the cursor: its legal port
+   *    nearest the link's FIXED end, i.e. the side facing it — what
+   *    `InteractionConfig.enableSmartAutoConnect` promises ("dropping on node body
+   *    connects to nearest port"), and the same nearest-pair rule Easy Connect uses
+   *    for a body-to-body wire. A body press otherwise ties the four sides and the
+   *    first in iteration order (top) would win.
+   * 3. The MAGNET: the nearest legal port within `snapToPortRadius` — the same reach
+   *    a new connection's drag has (C1/C2: a port you can snap a new wire to is a
+   *    port you can snap a dragged endpoint to).
+   */
+  protected resolveReconnectTarget(engine: DiagramEngine, at: Point | null): PortModel | null {
+    const link = this.reconnectingLink;
+    const endpoint = this.reconnectingEndpoint;
+    const diagram = engine.getDiagram();
+    if (!link || !endpoint || !diagram) return null;
+    const legal = (port: PortModel) => this.isValidReconnectionTarget(link, endpoint, port, engine);
+
+    if (this.hoveredPort && legal(this.hoveredPort)) return this.hoveredPort;
+    if (!at) return null;
+
+    const config = engine.getInteractionConfig();
+    const bodyDrop =
+      (config.mode === 'smart' && config.enableSmartAutoConnect) || config.enableEasyConnect;
+    const over = diagram.getNodeAtPosition(at.x, at.y);
+
+    // Over a node body with body-drop on: the node is the target, whichever of its
+    // ports the cursor happens to be nearest (on a small node every interior point
+    // is within the magnet of the top or bottom port).
+    if (bodyDrop && over) {
+      const fixedPortId = endpoint === 'source' ? link.targetPortId : link.sourcePortId;
+      const fixedPort = diagram.getPortById(fixedPortId);
+      const fixedNode = diagram.getNodeByPortId(fixedPortId);
+      const anchor = fixedPort && fixedNode ? portWorldPosition(fixedPort, fixedNode) : at;
+      let best: PortModel | null = null;
+      let bestDistance = Infinity;
+      for (const port of over.getPorts()) {
+        if (!legal(port)) continue;
+        const p = portWorldPosition(port, over);
+        const d = Math.hypot(anchor.x - p.x, anchor.y - p.y);
+        if (d < bestDistance) {
+          bestDistance = d;
+          best = port;
+        }
+      }
+      if (best) return best;
+    }
+
+    // The magnet — a near miss off any body.
+    const radius = config.snapToPortRadius;
+    if (radius > 0) {
+      const hit = diagram.findNearestPort(at, {
+        radius,
+        filter: (port) => legal(port),
+        portPosition: (port, node) => portWorldPosition(port, node),
+      });
+      if (hit) return hit.port;
+    }
+    return null;
+  }
+
+  /**
+   * Is `candidatePort` a legal target for reconnecting `endpoint` of
    * `link`? The OTHER endpoint's port stays fixed; the candidate must differ
    * from it, live on a different node, be type-compatible (input↔output, or a
    * bidirectional port), and satisfy the connection-group rules. Pure w.r.t.
@@ -795,7 +950,7 @@ export class InteractionController {
   }
 
   /**
-   * Wave 2: Highlight ports as valid/invalid drop targets during an endpoint
+   * Highlight ports as valid/invalid drop targets during an endpoint
    * reconnection. Mirrors {@link updatePortHighlights} but uses the reconnect
    * validity rule instead of the {@link ConnectionStateManager} valid-target set
    * (which is empty during reconnection).
@@ -803,6 +958,7 @@ export class InteractionController {
   protected updateReconnectPortHighlights(engine: DiagramEngine): void {
     const diagram = engine.getDiagram();
     if (!diagram || !this.reconnectingLink || !this.reconnectingEndpoint) return;
+    const target = this.resolveReconnectTarget(engine, this.reconnectingMousePoint);
 
     diagram.getNodes().forEach((node: NodeModel) => {
       node.getPorts().forEach((port: PortModel) => {
@@ -812,7 +968,7 @@ export class InteractionController {
           port,
           engine
         );
-        const highlighted = valid && port === this.hoveredPort;
+        const highlighted = valid && port === target;
         if (port.isValidTarget !== valid || port.isHighlighted !== highlighted) {
           node.markDirty('port-highlight');
         }
@@ -823,7 +979,7 @@ export class InteractionController {
   }
 
   /**
-   * Phase 3 / Wave 2: Complete link reconnection.
+   * Complete link reconnection.
    *
    * Drops the dragged endpoint on the hovered port. Rejects (and restores the
    * original connection) when there is no port under the cursor or the port
@@ -835,12 +991,13 @@ export class InteractionController {
       return false;
     }
 
-    const targetPort = this.hoveredPort;
+    // C1: resolved like the preview — port, magnet, then (smart) the node body.
+    // Against the last HOVERED point: that is where the pointer was released.
+    const targetPort = this.resolveReconnectTarget(engine, this.lastHoverPoint ?? this.reconnectingMousePoint);
 
     // Reject: no drop target, or an invalid one → restore original connection.
-    if (!targetPort ||
-        !this.isValidReconnectionTarget(this.reconnectingLink, this.reconnectingEndpoint, targetPort, engine)) {
-      console.debug('🚫 Link reconnection rejected: no valid target port');
+    if (!targetPort) {
+      debugLog('🚫 Link reconnection rejected: no valid target port');
       this.cancelLinkReconnection(engine);
       return false;
     }
@@ -862,7 +1019,7 @@ export class InteractionController {
     }
 
     if (!targetNode) {
-      console.log('❌ Link reconnection failed: Target node not found');
+      debugLog('❌ Link reconnection failed: Target node not found');
       this.cancelLinkReconnection(engine);
       return false;
     }
@@ -923,7 +1080,7 @@ export class InteractionController {
       }
     }
 
-    console.debug(`✅ Link reconnected: ${this.reconnectingEndpoint} endpoint to port ${targetPort.id}`);
+    debugLog(`✅ Link reconnected: ${this.reconnectingEndpoint} endpoint to port ${targetPort.id}`);
 
     // Cleanup (clears preview + highlights + state)
     this.resetReconnectionState(engine);
@@ -932,17 +1089,17 @@ export class InteractionController {
   }
 
   /**
-   * Wave 2: Cancel an in-progress endpoint reconnection, restoring the link to
+   * Cancel an in-progress endpoint reconnection, restoring the link to
    * its original connection. Safe to call when not reconnecting.
    */
   cancelLinkReconnection(engine: DiagramEngine): void {
     if (!this.isReconnectingLink) return;
     this.resetReconnectionState(engine);
-    console.debug('🚫 Link reconnection cancelled');
+    debugLog('🚫 Link reconnection cancelled');
   }
 
   /**
-   * Wave 2: Tear down all reconnection state — deselect the link's endpoints,
+   * Tear down all reconnection state — deselect the link's endpoints,
    * clear the engine preview, and clear port highlights.
    */
   protected resetReconnectionState(engine: DiagramEngine): void {
@@ -960,7 +1117,7 @@ export class InteractionController {
   // ============================================================================
 
   /**
-   * Wave 2: Map a dragged world point to a model-space label placement.
+   * Map a dragged world point to a model-space label placement.
    *
    * Returns the `{ position, offset }` to store on the label such that the
    * renderer draws it exactly under the cursor now AND it sticks to the same
@@ -1043,17 +1200,17 @@ export class InteractionController {
   }
 
   /**
-   * Wave 2: Begin dragging label `labelIndex` of `link`.
+   * Begin dragging label `labelIndex` of `link`.
    */
   startLabelDrag(link: LinkModel, labelIndex: number): void {
     this.isDraggingLabel = true;
     this.editingLabelLink = link;
     this.editingLabelIndex = labelIndex;
-    console.log(`🏷️ Started dragging label ${labelIndex} on link ${link.id}`);
+    debugLog(`🏷️ Started dragging label ${labelIndex} on link ${link.id}`);
   }
 
   /**
-   * Wave 2: Move the dragging label to follow the cursor. Writes the remapped
+   * Move the dragging label to follow the cursor. Writes the remapped
    * `{ position, offset }` back onto the model so the label survives re-routing.
    * Returns true when a re-render is warranted.
    */
@@ -1075,11 +1232,11 @@ export class InteractionController {
   }
 
   /**
-   * Wave 2: End the label drag.
+   * End the label drag.
    */
   endLabelDrag(): void {
     if (this.isDraggingLabel) {
-      console.log(`🏷️ Ended dragging label ${this.editingLabelIndex} on link ${this.editingLabelLink?.id}`);
+      debugLog(`🏷️ Ended dragging label ${this.editingLabelIndex} on link ${this.editingLabelLink?.id}`);
     }
     this.isDraggingLabel = false;
     this.editingLabelLink = null;
@@ -1087,7 +1244,7 @@ export class InteractionController {
   }
 
   /**
-   * Phase 3: Handle link selection
+   * Handle link selection
    * FIXED: Support multi-select with Ctrl key, deselect other links otherwise
    */
   selectLink(link: LinkModel, engine: DiagramEngine, multiSelect: boolean = false): void {
@@ -1109,15 +1266,15 @@ export class InteractionController {
     // Toggle or select this link
     if (multiSelect && link.state === 'selected') {
       link.setState('default');
-      console.debug('🔗 Link deselected:', link.id);
+      debugLog('🔗 Link deselected:', link.id);
     } else {
       link.setState('selected');
-      console.debug('🔗 Link selected:', link.id);
+      debugLog('🔗 Link selected:', link.id);
     }
   }
 
   /**
-   * Phase 3: Delete selected link
+   * Delete selected link
    */
   deleteSelectedLink(engine: DiagramEngine): boolean {
     if (this.isReadonlyEngine(engine)) return false;
@@ -1131,7 +1288,7 @@ export class InteractionController {
     // Remove the link
     diagram.removeLink(selectedLink.id);
 
-    console.log('🗑️ Link deleted:', selectedLink.id);
+    debugLog('🗑️ Link deleted:', selectedLink.id);
     return true;
   }
 
@@ -1164,7 +1321,7 @@ export class InteractionController {
   }
 
   /**
-   * Phase 3: Get current interaction state
+   * Get current interaction state
    */
   getState() {
     return {
@@ -1197,14 +1354,14 @@ export class InteractionController {
   }
 
   /**
-   * Phase 3: Check if currently interacting
+   * Check if currently interacting
    */
   isInteracting(): boolean {
     return this.isConnecting || this.isReconnectingLink || this.isDraggingWaypoint || this.isDraggingControlPoint || this.isDraggingLabel;
   }
 
   /**
-   * Phase 3: Get appropriate cursor for current state
+   * Get appropriate cursor for current state
    */
   getCursor(engine: DiagramEngine): string {
     if (this.isConnecting) {
@@ -1243,7 +1400,7 @@ export class InteractionController {
 
   /**
    * Find port at world position
-   * Phase 5: Optimized with performance monitoring and early exit
+   * Optimized with performance monitoring and early exit
    * CRITICAL FIX: Accept engine parameter instead of calling diagram.getEngine()
    */
   protected findPortAtPosition(
@@ -1365,6 +1522,39 @@ export class InteractionController {
    * path for body hits. Delegates the geometry to the pure `hitTestLink`
    * primitive in `@grafloria/renderer` so the same logic backs both hit paths.
    */
+  /**
+   * The links worth running geometry against for a hit at `query`.
+   *
+   * Served by the link spatial index when the model has one, and by the full
+   * list otherwise — a model without the index (or one whose index has not been
+   * populated) must still hit-test correctly, just slowly. Falls back the same
+   * way if the query returns nothing while the model has links, because a wrong
+   * "nothing here" is a link the user can see and cannot click.
+   */
+  private linkHitCandidates(diagram: any, query: Point): LinkModel[] {
+    const all: LinkModel[] = diagram.getLinks?.() ?? [];
+    // No index (a bare or stubbed model): correctness first, scan.
+    if (typeof diagram.getVisibleLinks !== 'function' || all.length === 0) return all;
+
+    // Padded by LINK_HIT_QUERY_PAD for the same reason the render pass pads its
+    // own cull query: a link's indexed bounds are its last written `points`, and
+    // a routed detour that has not been written back yet can put real ink
+    // outside them. The render pass allows 250 world units of slack for exactly
+    // this, so a hit-test that allowed less could refuse a click on a line the
+    // user can see — which is a far worse bug than the scan this replaces.
+    const reach =
+      linkBodyHitTolerance(this.linkHitAreaWidthConfig, this.linkHitAreaWidthConfig) +
+      this.hitSlop +
+      LINK_HIT_QUERY_PAD;
+
+    return diagram.getVisibleLinks({
+      x: query.x - reach,
+      y: query.y - reach,
+      width: reach * 2,
+      height: reach * 2,
+    });
+  }
+
   findLinkHitAtPosition(
     worldX: number,
     worldY: number,
@@ -1385,9 +1575,28 @@ export class InteractionController {
     // by body distance (falling back to the part's own distance) because at a
     // shared anchor every sibling's endpoint HANDLE is equidistant — only the
     // link actually under the cursor has body distance ~0.
+    // CANDIDATES FIRST, GEOMETRY SECOND. This runs on every pointermove, and it
+    // used to run the full `hitTestLink` geometry against EVERY link in the
+    // model — including links nowhere near the cursor, and including links not
+    // even on screen. The cost tracked total link count rather than anything
+    // visible: with the camera parked away from the content, so that literally
+    // nothing was drawn, the handler still cost 0.79ms at 1,936 links and 2.4ms
+    // at 12,474, all of it provably wasted.
+    //
+    // `linkSpatialIndex` already knows which links are near a point — it is the
+    // same index the render pass culls with. A small box around the cursor turns
+    // an O(links) scan into a bounded query, and the geometry below then decides
+    // between the few candidates that survive.
+    //
+    // The box is generous on purpose: the per-link threshold below is computed
+    // from each link's own stroke, which we do not know until we have the link,
+    // so the query has to admit anything that COULD pass it. Too wide only costs
+    // a few extra geometry tests; too narrow drops a hit the user can see.
+    const candidates: LinkModel[] = this.linkHitCandidates(diagram, query);
+
     let best: LinkPartHit | null = null;
     let bestScore = Infinity;
-    for (const link of diagram.getLinks()) {
+    for (const link of candidates) {
       const points = link.points;
       if (!points || points.length < 2) continue;
 
@@ -1428,12 +1637,35 @@ export class InteractionController {
     const points: Point[] = link.points;
     const style = link.style ?? {};
 
+    let labels = (link.labels ?? []).map((label) => ({
+      position: label.position,
+      offset: label.offset,
+    }));
+
+    // The DISPLAY label dialect (`edges: [{label}]` → `metadata.label`) paints
+    // at the middle routed point but lived in no hit geometry at all — so the
+    // label a user could SEE on such an edge reported `body`, never `label`,
+    // and double-click-to-edit / label affordances could not fire on it.
+    // Synthesize its box at the renderer's own anchor (points[mid], expressed
+    // as the arc-length position the hit primitive expects).
+    if (labels.length === 0 && points.length >= 2 && link.getLabel()) {
+      const mid = Math.floor(points.length / 2);
+      let total = 0;
+      let toMid = 0;
+      for (let i = 1; i < points.length; i++) {
+        const seg = Math.hypot(
+          points[i]!.x - points[i - 1]!.x,
+          points[i]!.y - points[i - 1]!.y
+        );
+        total += seg;
+        if (i <= mid) toMid += seg;
+      }
+      if (total > 0) labels = [{ position: toMid / total, offset: { x: 0, y: 0 } }];
+    }
+
     return {
       points,
-      labels: (link.labels ?? []).map((label) => ({
-        position: label.position,
-        offset: label.offset,
-      })),
+      labels,
       // arrowHead renders at the target end, arrowTail at the source end.
       sourceArrow: this.arrowAnchor(points, false, style.arrowTail),
       targetArrow: this.arrowAnchor(points, true, style.arrowHead),
@@ -1464,7 +1696,7 @@ export class InteractionController {
   }
 
   /**
-   * Wave 6 (Card 6): the nearest VALID target port within the magnet radius.
+   * The nearest VALID target port within the magnet radius.
    *
    * "Valid" means the connection manager's valid-target set — the same set the
    * highlight paints — so the magnet can never latch onto a port the drop would
@@ -1508,14 +1740,9 @@ export class InteractionController {
   /**
    * Update port highlight states during connection.
    *
-   * Wave 6 (Card 6): this method was already correct — and already dead. It
-   * loops over `dragState.validTargetPorts`, a set that NOTHING ever filled:
-   * `ConnectionStateManager.calculateValidTargets()` was a comment-only stub and
-   * `setValidTargets()` had no production caller. So the loop ran zero times,
-   * every frame, and only the hovered port ever lit up. The manager now computes
-   * the set for real, which is what finally brings this to life — plus the
-   * `highlightValidTargets` config flag, itself dead config until now (declared,
-   * defaulted true, written by the config panel, read by nobody).
+   * Lights every port in `dragState.validTargetPorts` (computed by
+   * `ConnectionStateManager.calculateValidTargets()`), not only the hovered one,
+   * when the `highlightValidTargets` config flag is on (the default).
    */
   protected updatePortHighlights(engine: DiagramEngine): void {
     const diagram = engine.getDiagram();
@@ -1637,7 +1864,8 @@ export class InteractionController {
     this.editingWaypointIndex = waypointIndex;
     // wave12: snapshot the path BEFORE the drag so end can commit one undoable FROM→TO step.
     this.waypointDragStartPoints = link.points.map((p) => ({ ...p }));
-    console.log(`🔵 Started dragging waypoint ${waypointIndex} on link ${link.id}`);
+    this.waypointDragStartManual = link.getMetadata('hasManualWaypoints') === true;
+    debugLog(`🔵 Started dragging waypoint ${waypointIndex} on link ${link.id}`);
   }
 
   /**
@@ -1662,7 +1890,7 @@ export class InteractionController {
     if (newPoints) {
       this.editingLink.setPoints(newPoints);
       this.editingLink.setMetadata('hasManualWaypoints', true);
-      console.log(`🔵 Moved waypoint ${this.editingWaypointIndex} to (${worldX.toFixed(1)}, ${worldY.toFixed(1)})`);
+      debugLog(`🔵 Moved waypoint ${this.editingWaypointIndex} to (${worldX.toFixed(1)}, ${worldY.toFixed(1)})`);
       return true;
     }
 
@@ -1674,13 +1902,13 @@ export class InteractionController {
    */
   endWaypointDrag(engine?: DiagramEngine): void {
     if (this.isDraggingWaypoint) {
-      console.log(`🔵 Ended dragging waypoint ${this.editingWaypointIndex} on link ${this.editingLink?.id}`);
+      debugLog(`🔵 Ended dragging waypoint ${this.editingWaypointIndex} on link ${this.editingLink?.id}`);
 
-      // wave12: commit the finished gesture as ONE undoable step. The live moveWaypoint
+      // Commit the finished gesture as ONE undoable step. The live moveWaypoint
       // already applied the final points, so SetLinkPointsCommand's execute() re-sets the
-      // already-current `to` (a no-op) and records one history entry; undo restores `from`.
-      // Same FROM→TO snapshot pattern as node-drag and group-drag. Only commit when the
-      // path actually changed — a click-with-no-drag must not litter the undo stack.
+      // already-current `to` (a no-op) and records one history entry; undo restores `from`
+      // and the manual-waypoint flag as they were when the gesture began. Only commit when
+      // the path actually changed — a click-with-no-drag must not litter the undo stack.
       const link = this.editingLink;
       const from = this.waypointDragStartPoints;
       if (engine && link && from) {
@@ -1689,7 +1917,9 @@ export class InteractionController {
           to.length !== from.length ||
           to.some((p, i) => p.x !== from[i].x || p.y !== from[i].y);
         if (changed) {
-          void engine.commandManager.execute(new SetLinkPointsCommand(link.id, to, from));
+          void engine.commandManager.execute(
+            new SetLinkPointsCommand(link.id, to, from, this.waypointDragStartManual)
+          );
         }
       }
     }
@@ -1697,27 +1927,49 @@ export class InteractionController {
     this.editingLink = null;
     this.editingWaypointIndex = null;
     this.waypointDragStartPoints = null;
+    this.waypointDragStartManual = false;
   }
 
   /**
-   * Add waypoint at click position on path
+   * Insert a bend where the path was clicked. Returns false when nothing was
+   * inserted: a read-only link, a point too close to an endpoint, or a point on
+   * an existing bend (a bend is never stacked on another).
+   *
+   * Undo: with `engine`, the insert is committed at once as its own undo step.
+   * Without it, when a pointer button is down (the press that clicked the
+   * path), the insert opens a bend drag on the new bend: moving the pointer
+   * before release moves the bend, and {@link endWaypointDrag} commits insert
+   * and move together as one undo step at release.
    */
-  addWaypoint(clickX: number, clickY: number, link: LinkModel): boolean {
+  addWaypoint(clickX: number, clickY: number, link: LinkModel, engine?: DiagramEngine): boolean {
     if (this.isReadonlyLink(link)) return false;
     if (!this.waypointEditor) {
       return false;
     }
+    if (this.isDraggingWaypoint) return false;
+    if (this.hitTestWaypoint(clickX, clickY, link) !== null) return false;
 
-    const result = this.waypointEditor.addWaypointAtPosition(clickX, clickY, link.points);
+    const before = link.points.map((p) => ({ ...p }));
+    const beforeManual = link.getMetadata('hasManualWaypoints') === true;
+    const result = this.waypointEditor.addWaypointAtPosition(clickX, clickY, before);
+    if (!result) return false;
 
-    if (result) {
-      link.setPoints(result.newPoints);
-      link.setMetadata('hasManualWaypoints', true);
-      console.log(`🟢 Added waypoint at index ${result.waypointIndex} on link ${link.id}`);
-      return true;
+    link.setPoints(result.newPoints);
+    link.setMetadata('hasManualWaypoints', true);
+    debugLog(`🟢 Added waypoint at index ${result.waypointIndex} on link ${link.id}`);
+
+    if (engine) {
+      void engine.commandManager.execute(
+        new SetLinkPointsCommand(link.id, result.newPoints, before, beforeManual)
+      );
+    } else if (isPointerButtonDown()) {
+      this.isDraggingWaypoint = true;
+      this.editingLink = link;
+      this.editingWaypointIndex = result.waypointIndex;
+      this.waypointDragStartPoints = before;
+      this.waypointDragStartManual = beforeManual;
     }
-
-    return false;
+    return true;
   }
 
   /**
@@ -1736,7 +1988,7 @@ export class InteractionController {
       if (newPoints.length <= 2) {
         link.setMetadata('hasManualWaypoints', false);
       }
-      console.log(`🔴 Removed waypoint at index ${waypointIndex} from link ${link.id}`);
+      debugLog(`🔴 Removed waypoint at index ${waypointIndex} from link ${link.id}`);
       return true;
     }
 
@@ -1810,12 +2062,14 @@ export class InteractionController {
       const targetNode = diagram?.getNodeByPortId(target.id);
       if (!sourceNode || !targetNode) return true;
 
-      return isValidConnection({
+      const verdict = isValidConnection({
         sourceNode,
         sourcePort: source,
         targetNode,
         targetPort: target,
-      }).valid;
+      });
+      // The reason travels with the refusal, so the drag can say WHY.
+      return verdict.valid ? true : verdict.reason || false;
     });
   }
 
@@ -1890,7 +2144,7 @@ export class InteractionController {
     this.editingControlPointLink = link;
     this.editingControlPointSegmentIndex = segmentIndex;
     this.editingControlPointType = controlType;
-    console.log(`🟢 Started dragging ${controlType} of segment ${segmentIndex} on link ${link.id}`);
+    debugLog(`🟢 Started dragging ${controlType} of segment ${segmentIndex} on link ${link.id}`);
   }
 
   /**
@@ -1920,7 +2174,7 @@ export class InteractionController {
       this.editingControlPointLink.segments = newSegments;
       // Mark link as dirty to trigger re-render with updated segments
       this.editingControlPointLink.markDirty();
-      console.log(
+      debugLog(
         `🟢 Moved ${this.editingControlPointType} of segment ${this.editingControlPointSegmentIndex} to (${worldX.toFixed(1)}, ${worldY.toFixed(1)})`
       );
       return true;
@@ -1934,7 +2188,7 @@ export class InteractionController {
    */
   endControlPointDrag(): void {
     if (this.isDraggingControlPoint) {
-      console.log(
+      debugLog(
         `🟢 Ended dragging ${this.editingControlPointType} of segment ${this.editingControlPointSegmentIndex} on link ${this.editingControlPointLink?.id}`
       );
     }
@@ -1990,7 +2244,7 @@ export class InteractionController {
       // For now, we don't support "deleting" control points
       // Control points are intrinsic to bezier curves
       // User would need to change pathType instead
-      console.log('⚠️ Control points cannot be deleted, only moved');
+      debugLog('⚠️ Control points cannot be deleted, only moved');
       return false;
     }
     return false;

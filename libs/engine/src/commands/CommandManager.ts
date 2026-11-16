@@ -1,20 +1,21 @@
 // CommandManager - Manages command execution, undo, and redo
 
+import type { HistoryOwner } from './history-owner';
 import { Command, CommandContext } from './Command';
 import { BatchCommand } from './composite/BatchCommand';
 import { EventBus } from '../events/EventBus';
 import { DiagramEventTypes } from '../types/event.types';
+import { engineNow } from '../utils/deterministic';
 
 export interface CommandHistoryEntry {
   command: Command;
   timestamp: number;
   duration: number;
   /**
-   * Wave 14: history only ever records commands that EXECUTED successfully, so
+   * History only ever records commands that EXECUTED successfully, so
    * this is always `true` and `error` is never set. Both fields survive purely
    * for API compatibility — a command that throws (or fails strict validation)
-   * no longer enters history at all, because canUndo()/undo() never consulted
-   * these flags and would happily "undo" a mutation that never happened.
+   * never enters history.
    */
   success: boolean;
   error?: Error;
@@ -52,9 +53,31 @@ export class CommandManager {
   }
 
   /**
-   * Execute a command
+   * Who owns undo when it isn't this stack — a collaborative Replica (see
+   * history-owner.ts). `context.diagram` is typed `any`, hence the probe.
+   */
+  private historyOwner(): HistoryOwner | null {
+    return this.context?.diagram?.getHistoryOwner?.() ?? null;
+  }
+
+  /**
+   * Execute a command. Under a history owner the whole command — every op it
+   * makes, across its awaits — is ONE step on the owner's stack. The step opens
+   * synchronously, before the first await, so a caller's enclosing step (a canvas
+   * press) still contains it.
    */
   async execute(command: Command): Promise<void> {
+    const owner = this.historyOwner();
+    if (!owner) return this.executeUnframed(command);
+    owner.beginStep();
+    try {
+      await this.executeUnframed(command);
+    } finally {
+      owner.endStep();
+    }
+  }
+
+  private async executeUnframed(command: Command): Promise<void> {
     // Refused BEFORE canExecute so a command cannot mutate anything in its own
     // permission check, and before the merge path below — a merged command
     // re-executes, which would otherwise be a hole straight through the lock.
@@ -103,12 +126,20 @@ export class CommandManager {
     // Only a command that EXECUTED (and validated) may enter history. A thrown
     // execute() used to land here anyway — via a `finally` — leaving Ctrl+Z
     // pointing at a mutation that never happened.
-    this.addToHistory({
-      command,
-      timestamp: Date.now(),
-      duration,
-      success: true,
-    });
+    //
+    // And only a command that DECLARES ITSELF UNDOABLE. A non-mutating command
+    // (Copy) recorded here used to poison the stack: undo() reached the entry,
+    // its canUndo() said no, the throw skipped the index decrement, and every
+    // entry behind it became permanently unreachable while canUndo() kept
+    // reporting true.
+    if (command.isUndoable()) {
+      this.addToHistory({
+        command,
+        timestamp: engineNow(),
+        duration,
+        success: true,
+      });
+    }
 
     this.eventBus.emit(DiagramEventTypes.COMMAND_EXECUTED, {
       command,
@@ -158,7 +189,7 @@ export class CommandManager {
     }
 
     lastEntry.command = merged;
-    lastEntry.timestamp = Date.now();
+    lastEntry.timestamp = engineNow();
     this.eventBus.emit(DiagramEventTypes.COMMAND_MERGED, { command: merged });
   }
 
@@ -199,6 +230,13 @@ export class CommandManager {
       return;
     }
 
+    // Under a history owner, undo is ITS: per actor, never a peer's edit.
+    const owner = this.historyOwner();
+    if (owner) {
+      owner.undo();
+      return;
+    }
+
     if (!this.canUndo()) {
       return;
     }
@@ -208,8 +246,15 @@ export class CommandManager {
 
     const command = entry.command;
 
+    // A STALE command: what it changed is no longer in the document (a load, a
+    // host's setEdges reconcile, a plugin removed it outside any command). It is
+    // not an error the user can act on, so it never throws — the old throw reached
+    // a keyboard handler as an uncaught rejection (S10, docs review v4). It and
+    // every older step go: they were made on a document that no longer exists, and
+    // undoing them one by one would replay positions and links onto the new one.
     if (!command.canUndo(this.context)) {
-      throw new Error(`Cannot undo command: ${command.name}`);
+      this.dropStale('undo', command);
+      return;
     }
 
     const startTime = performance.now();
@@ -230,7 +275,8 @@ export class CommandManager {
         action: 'undo',
         error,
       });
-      throw error;
+      // Its target vanished in a way canUndo() could not see: stale all the same.
+      this.dropStale('undo', command);
     }
   }
 
@@ -240,6 +286,12 @@ export class CommandManager {
   async redo(): Promise<void> {
     if (this.isReadonly()) {
       this.eventBus.emit('command:refused', { reason: 'readonly', phase: 'redo' });
+      return;
+    }
+
+    const owner = this.historyOwner();
+    if (owner) {
+      owner.redo();
       return;
     }
 
@@ -271,7 +323,9 @@ export class CommandManager {
         action: 'redo',
         error,
       });
-      throw error;
+      // A redo that cannot apply to the document as it is now is stale (see
+      // undo): the redo branch goes, and Ctrl+Shift+Z never throws at the user.
+      this.dropStale('redo', command);
     }
   }
 
@@ -285,10 +339,9 @@ export class CommandManager {
 
   /**
    * End batch mode: commit the queued commands as ONE BatchCommand through the
-   * normal execute() path (wave 14) — one history entry, one undo step (with
+   * normal execute() path — one history entry, one undo step (with
    * reverse-order undo), and the same strict-validation gate as any other
-   * command. The old code looped executeCommand() directly, so a "batch"
-   * mutated the diagram while building NO history at all.
+   * command.
    *
    * Note BatchCommand's existing gate contract: its canExecute() checks every
    * queued command against the CURRENT (pre-batch) state, so a queue whose
@@ -336,9 +389,29 @@ export class CommandManager {
   }
 
   /**
+   * Forget the part of history a stale command sits on: for undo, that entry and
+   * every older one; for redo, the whole redo branch. Announced as
+   * `command:history-stale` so a host can tell the user why Ctrl+Z went quiet.
+   */
+  private dropStale(phase: 'undo' | 'redo', command: Command): void {
+    let dropped: number;
+    if (phase === 'undo') {
+      dropped = this.currentIndex + 1;
+      this.history = this.history.slice(this.currentIndex + 1);
+      this.currentIndex = -1;
+    } else {
+      dropped = this.history.length - (this.currentIndex + 1);
+      this.history = this.history.slice(0, this.currentIndex + 1);
+    }
+    this.eventBus.emit('command:history-stale', { command, phase, dropped });
+  }
+
+  /**
    * Can undo
    */
   canUndo(): boolean {
+    const owner = this.historyOwner();
+    if (owner) return owner.canUndo;
     return this.currentIndex >= 0;
   }
 
@@ -346,6 +419,8 @@ export class CommandManager {
    * Can redo
    */
   canRedo(): boolean {
+    const owner = this.historyOwner();
+    if (owner) return owner.canRedo;
     return this.currentIndex < this.history.length - 1;
   }
 
@@ -448,7 +523,7 @@ export class CommandManager {
     const lastCommand = lastEntry.command;
 
     // Check time window
-    const timeDiff = Date.now() - lastEntry.timestamp;
+    const timeDiff = engineNow() - lastEntry.timestamp;
     if (timeDiff > this.mergingWindow) {
       return false;
     }

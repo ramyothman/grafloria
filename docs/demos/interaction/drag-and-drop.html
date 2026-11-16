@@ -1,6 +1,14 @@
 <meta charset="utf-8">
 <title>Drag & drop from a palette — Grafloria</title>
-<link rel="stylesheet" href="../shell/demo.css">
+<meta name="description" content="Drag a node type from a palette and drop it on the canvas. It is created at the drop point in WORLD space, and a second drop makes a second, independent node.">
+<link rel="canonical" href="https://grafloria.com/demos/interaction/drag-and-drop.html">
+<meta property="og:title" content="Drag &amp; drop from a palette — Grafloria">
+<meta property="og:description" content="Drag a node type from a palette and drop it on the canvas. It is created at the drop point in WORLD space, and a second drop makes a second, independent node.">
+<meta property="og:url" content="https://grafloria.com/demos/interaction/drag-and-drop.html">
+<meta property="og:image" content="https://grafloria.com/demos/thumbs/interaction/drag-and-drop.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://grafloria.com/demos/thumbs/interaction/drag-and-drop.png">
+<link rel="stylesheet" href="../shell/demo.css?v=drawer4">
 <style>
   #wrap { display: grid; grid-template-columns: 160px 1fr; height: calc(100vh - 120px); }
   #palette { border-right: 1px solid rgba(127,127,127,.25); padding: 12px; display: flex; flex-direction: column; gap: 10px; }
@@ -19,7 +27,7 @@
 </div>
 <script type="module">
 import { render } from '../shell/grafloria.js';
-import { defineDemo, check } from '../shell/demo.js';
+import { defineDemo, check } from '../shell/demo.js?v=drawer4';
 
 // Drag a chip out of the palette and drop it on the canvas: a node is created AT
 // THE DROP POINT, in world coordinates (so it lands where the cursor is even after
@@ -43,14 +51,10 @@ defineDemo({
     ctx.engine = api.getEngine();
 
     // Map a client (screen) point to world coordinates through the live viewport —
-    // the same transform a real editor uses so a drop lands under the cursor.
-    ctx.clientToWorld = (clientX, clientY) => {
-      const rect = ctx.host.getBoundingClientRect();
-      const vp = api.viewport;
-      const zoom = vp.getZoom();
-      const v = vp.getViewport();
-      return { x: v.x + (clientX - rect.left) / zoom, y: v.y + (clientY - rect.top) / zoom };
-    };
+    // the same transform a real editor uses so a drop lands under the cursor. The
+    // viewport zooms about its centre, so its own clientToWorld is the exact inverse
+    // of what is drawn ("viewport.x + px / zoom" is only right at zoom 1).
+    ctx.clientToWorld = (clientX, clientY) => api.viewport.clientToWorld(clientX, clientY, ctx.host.getBoundingClientRect());
 
     // The real drop handler: create a node at the world point for the dropped kind.
     ctx.dropAt = async (kind, clientX, clientY) => {
@@ -113,6 +117,27 @@ defineDemo({
     const n2Before = { x: n2.position.x, y: n2.position.y };
     model.getNode(n1.id).setPosition(0, 0);
     check(n2.position.x === n2Before.x && n2.position.y === n2Before.y, 'moving the first node moved the second — they are not independent');
+
+    // 5. ZOOMED, the drop still lands under the pointer. The viewport zooms about its
+    //    centre, so "viewport.x + px / zoom" drifts at any zoom other than 1.
+    const vp = ctx.instance.viewport, z0 = vp.getZoom();
+    vp.setZoom(0.6); ctx.instance.renderNow();
+    const p3 = { x: rect.left + 300, y: rect.top + 180 };
+    const n3 = await ctx.dropAt('transform', p3.x, p3.y);
+    await ctx.tick();
+    const r3 = ctx.host.querySelector(`[data-node-id="${n3.id}"] .diagram-node, [data-node-id="${n3.id}"] rect`)?.getBoundingClientRect();
+    const cx = r3 ? r3.left + r3.width / 2 : NaN, cy = r3 ? r3.top + r3.height / 2 : NaN;
+    check(Math.abs(cx - p3.x) < 3 && Math.abs(cy - p3.y) < 3, `at zoom 0.6 the dropped node is centred ${Math.round(cx - p3.x)},${Math.round(cy - p3.y)} px from the pointer, not under it`);
+    vp.setZoom(z0); ctx.instance.renderNow();
+  },
+
+  // The card's picture: four palette items dropped onto the canvas.
+  async showcase(ctx) {
+    const r = ctx.host.getBoundingClientRect();
+    for (const [kind, x, y] of [['source', 200, 150], ['filter', 420, 150], ['transform', 640, 150], ['sink', 420, 300]]) {
+      await ctx.dropAt(kind, r.left + x, r.top + y);
+    }
+    await ctx.tick();
   },
 });
 </script>

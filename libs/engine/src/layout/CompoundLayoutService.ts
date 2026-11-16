@@ -97,11 +97,12 @@ import type { LayoutAdapter, LayoutResult } from './layout-adapter.interface';
 import type { GroupInfo } from './subgraph-layout.interface';
 import type { UnifiedLayoutOptions } from './layout-registry';
 import { translateOptions } from './layout-registry';
+import { layoutPool } from '../interaction/swimlane-layout';
 
 /**
- * Any registered layout name, or the built-in grid. Wave 5 hard-coded
- * `'dagre' | 'elk'`; nested layout now resolves whatever the registry knows
- * (force, spectral, community, or an extension-registered engine).
+ * Any registered layout name, or the built-in grid. Nested layout resolves
+ * whatever the registry knows (dagre, elk, force, spectral, community, or an
+ * extension-registered engine).
  */
 export type CompoundAlgorithm = 'grid' | 'dagre' | 'elk' | (string & {});
 
@@ -110,7 +111,7 @@ export interface CompoundLayoutOptions {
   defaultAlgorithm?: CompoundAlgorithm;
   /** Injected adapters used as black boxes, keyed by name. Unknown → grid. */
   adapters?: Record<string, LayoutAdapter | undefined>;
-  /** Fallback padding for groups without their own (Card 3) padding. */
+  /** Fallback padding for groups without their own padding. */
   defaultPadding?: number;
   /** Gap between units in the built-in grid. */
   gridGap?: number;
@@ -212,6 +213,28 @@ export class CompoundLayoutService {
       if (group.isCollapsed) {
         result.collapsed.push(group.id);
         result.skipped.push(group.id);
+        result.groupBounds.set(group.id, group.getOuterBounds());
+        continue;
+      }
+
+      // A POOL is laid out as one unit, by the swimlane layout: its steps go along
+      // the lanes by their links and stay in their own lanes; the lanes stay tiled
+      // in order. Its lanes are never laid out on their own (that ranked each
+      // lane blind to the links between lanes) nor arranged as free boxes (that
+      // tore the pool apart). At the level above, the pool is one box.
+      if (group.laneConfig?.role === 'lane' && group.parentGroupId &&
+          this.diagram.getGroup(group.parentGroupId)?.laneConfig?.role === 'pool') {
+        result.groupBounds.set(group.id, group.getOuterBounds());
+        continue;
+      }
+      if (group.laneConfig?.role === 'pool') {
+        if (!this.isFixed(group)) {
+          const o = this.resolveLayoutOptions(group);
+          layoutPool(this.diagram, group, { rankSpacing: o.rankSpacing, nodeSpacing: o.nodeSpacing });
+          result.laidOut.push(group.id);
+        } else {
+          result.skipped.push(group.id);
+        }
         result.groupBounds.set(group.id, group.getOuterBounds());
         continue;
       }

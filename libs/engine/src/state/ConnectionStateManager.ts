@@ -62,7 +62,7 @@ export interface ConnectionDragState {
   isOverValidTarget: boolean;
 
   /**
-   * Wave 6 (Card 6): every port the drag has REJECTED, and why.
+   * Every port the drag has REJECTED, and why.
    *
    * The renderer draws an explicit "no" cue on a rejected target and dims ports
    * whose data type is incompatible — it can only do that if the rejection is
@@ -78,13 +78,14 @@ export interface ConnectionDragState {
 }
 
 /**
- * Connection validation function
- * Returns true if connection is allowed
+ * Connection validation function.
+ * Returns true if the connection is allowed; false refuses it; a non-empty
+ * string refuses it and becomes the drag state's `rejectionMessage`.
  */
 export type ConnectionValidator = (
   sourcePort: PortModel,
   targetPort: PortModel
-) => boolean;
+) => boolean | string;
 
 /**
  * Manages connection creation state during drag operations

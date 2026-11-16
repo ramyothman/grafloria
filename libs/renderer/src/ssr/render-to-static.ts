@@ -1,16 +1,18 @@
-import { DiagramEngine } from '@grafloria/engine';
+import { DiagramEngine, runDeterministic } from '@grafloria/engine';
 import type { Theme } from '../types/theme.types';
+import type { LODMode } from '../types/renderer.interface';
 import { SVGRenderer } from '../svg/svg-renderer';
 import { ViewportController } from '../viewport/viewport-controller';
-import { applyEdges, applyNodes } from '../instance/model-input';
-import type { EdgeSpec, NodeSpec } from '../instance/model-input';
+import { applyEdges, applyGroups, applyNodes } from '../instance/model-input';
+import type { EdgeSpec, GroupSpec, NodeSpec } from '../instance/model-input';
+import { contentBounds } from '../instance/content-bounds';
 import {
   HTML_LAYER_CLASS,
   ROOT_CLASS,
-  ROOT_STYLE,
+  SERVER_ROOT_STYLE,
   SVG_LAYER_CLASS,
-  SVG_LAYER_STYLE,
   htmlLayerStyle,
+  serverSvgLayerStyle,
 } from '../instance/layers';
 import { serializeVNode } from '../export/vnode-serializer';
 
@@ -54,6 +56,8 @@ import { serializeVNode } from '../export/vnode-serializer';
 export interface StaticRenderOptions {
   nodes?: NodeSpec[];
   edges?: EdgeSpec[];
+  /** Group / lane frames, as `render()` and `setGroups()` take them. */
+  groups?: GroupSpec[];
   theme?: Theme;
   /** Canvas width in CSS px. Default 800. */
   width?: number;
@@ -73,6 +77,13 @@ export interface StaticRenderOptions {
   fitPadding?: number;
   /** Add `xmlns` to the `<svg>` so it stands alone as a file. Default false. */
   standalone?: boolean;
+  /**
+   * Level of detail. `'document'` — what a figure in a page wants: never shed
+   * labels or arrowheads, at any zoom or size (a static picture cannot be
+   * zoomed in). `'auto'` (default) follows the zoom through the diagram's LOD
+   * policy, which drops them below zoom 0.5. See `SVGRendererConfig.lod`.
+   */
+  lod?: LODMode;
 }
 
 /** Everything the client needs to reproduce this render exactly. */
@@ -85,7 +96,13 @@ export interface HydrationSnapshot {
 }
 
 export interface StaticRenderResult {
-  /** The full layer skeleton — drop this straight into your container. */
+  /**
+   * The full layer skeleton — drop this straight into your container. Until a
+   * client adopts it (`createDiagram(el, { hydrate: snapshot })`) it draws the
+   * canvas at its own `width`×`height`, 1:1, centred on the container — where
+   * the live camera will put it, so resuming moves and scales nothing. For a
+   * picture that stays static and sizes itself, use `svg`.
+   */
   html: string;
   /** Only the `<svg>` element. */
   svg: string;
@@ -101,6 +118,14 @@ export interface StaticRenderResult {
 }
 
 export function renderToStaticSVG(options: StaticRenderOptions = {}): StaticRenderResult {
+  // C13: a static render reads NO clock and NO random source — entity timestamps
+  // freeze and ids come from a counter (see engine `runDeterministic`). A server
+  // component prerendered under Next's `cacheComponents` refused the first
+  // `Date.now()`, and the same input now gives the same bytes.
+  return runDeterministic(() => renderStaticNow(options));
+}
+
+function renderStaticNow(options: StaticRenderOptions): StaticRenderResult {
   const width = options.width ?? 800;
   const height = options.height ?? 600;
   const instanceId = options.instanceId ?? 'grafloria-ssr';
@@ -110,6 +135,8 @@ export function renderToStaticSVG(options: StaticRenderOptions = {}): StaticRend
 
   applyNodes(model, options.nodes ?? []);
   applyEdges(model, options.edges ?? []);
+  // After nodes, as on the client: a group's children must exist to join it.
+  if (options.groups) applyGroups(model, options.groups);
 
   const viewport = new ViewportController({
     viewport: {
@@ -122,23 +149,35 @@ export function renderToStaticSVG(options: StaticRenderOptions = {}): StaticRend
   });
 
   if (options.fitView) {
-    const bounds = contentBoundsOf(model);
+    // The live fitView()'s own bounds: nodes, routed waypoints AND group/lane
+    // frames with their captions. Counting nodes alone clipped a lane's frame.
+    const bounds = contentBounds(model, options.theme);
     if (bounds) viewport.fitToBounds(bounds, options.fitPadding ?? 40);
   }
 
   // `useCSSMode` stays ON: the renderer's document access is now guarded
   // (see SVGRenderer.injectThemeCSS), so the VNode tree the server produces is
   // the SAME tree the browser produces — which is the whole point.
-  const renderer = new SVGRenderer(engine, { instanceId }, options.theme);
+  const renderer = new SVGRenderer(engine, { instanceId, lod: options.lod }, options.theme);
   const vnode = renderer.render(viewport.getRenderViewport(), viewport.getZoom());
-  // A static artifact must SIZE ITSELF: the live path leaves width/height to the
-  // host's CSS, but an email, a README or a bare <img> cannot add CSS — without
-  // these the svg renders 0×0 (the audit's "blank page with a stray dot").
-  vnode.props = { ...vnode.props, width: options.width ?? 800, height: options.height ?? 600 };
   // ONE serializer, in DOM fidelity: the snapshot must describe exactly the DOM the
   // client's VNodePatcher would build, or hydration rebuilds the tree and flashes.
   // (The same function in 'file' fidelity is what `export/` uses for standalone SVG.)
-  const svg = serializeVNode(vnode, { fidelity: 'dom', standalone: options.standalone });
+  //
+  // TWO strings from it. `html` is what the client ADOPTS, so it carries the live
+  // path's root exactly — no width/height; an outer <svg> without them fills its
+  // full-size layer. The patcher adopts attributes, it does not strip them: a
+  // fixed size here outlived hydration, and once the camera synced to a container
+  // larger than the server's canvas the browser letterboxed the picture and drags
+  // ran at half speed (found by the Qwik SSR demo, 900×420 into 1020×800).
+  const live = serializeVNode(vnode, { fidelity: 'dom', standalone: options.standalone });
+  // `svg` stands ALONE, so it must SIZE ITSELF: an email, a README or a bare <img>
+  // cannot add CSS — without these it renders 0×0 (the audit's "blank page with
+  // a stray dot").
+  const svg = serializeVNode(
+    { ...vnode, props: { ...vnode.props, width: options.width ?? 800, height: options.height ?? 600 } },
+    { fidelity: 'dom', standalone: options.standalone }
+  );
   const css = renderer.getStyleSheet();
 
   renderer.dispose();
@@ -152,36 +191,22 @@ export function renderToStaticSVG(options: StaticRenderOptions = {}): StaticRend
     viewport: { x: viewport.getViewport().x, y: viewport.getViewport().y },
   };
 
-  return { html: wrapInLayers(svg, instanceId), svg, css, snapshot };
+  return { html: wrapInLayers(live, instanceId, width, height), svg, css, snapshot };
 }
 
-/** The markup `createDiagram()`'s `ensureLayers()` builds — as a string. */
-function wrapInLayers(svg: string, instanceId: string): string {
+/**
+ * The markup `createDiagram()`'s `ensureLayers()` builds — as a string — except
+ * that the SVG layer holds the server canvas at 1:1, centred, until the client
+ * adopts it (see `serverSvgLayerStyle`): no scale-to-fit before resume, so
+ * nothing snaps on resume (v4 S9).
+ */
+function wrapInLayers(svg: string, instanceId: string, width: number, height: number): string {
   return (
-    `<div class="${ROOT_CLASS}" style="${ROOT_STYLE}" data-grafloria-instance="${instanceId}">` +
-    `<div class="${SVG_LAYER_CLASS}" style="${SVG_LAYER_STYLE}">${svg}</div>` +
+    `<div class="${ROOT_CLASS}" style="${SERVER_ROOT_STYLE}" data-grafloria-instance="${instanceId}">` +
+    `<div class="${SVG_LAYER_CLASS}" style="${serverSvgLayerStyle(width, height)}">${svg}</div>` +
     `<div class="${HTML_LAYER_CLASS}" style="${htmlLayerStyle(
       'translate(0px, 0px) scale(1)'
     )}"></div>` +
     `</div>`
   );
-}
-
-function contentBoundsOf(
-  model: ReturnType<DiagramEngine['createDiagram']>
-): { x: number; y: number; width: number; height: number } | null {
-  const nodes = model.getNodes();
-  if (nodes.length === 0) return null;
-
-  let left = Infinity;
-  let top = Infinity;
-  let right = -Infinity;
-  let bottom = -Infinity;
-  for (const node of nodes) {
-    left = Math.min(left, node.position.x);
-    top = Math.min(top, node.position.y);
-    right = Math.max(right, node.position.x + node.size.width);
-    bottom = Math.max(bottom, node.position.y + node.size.height);
-  }
-  return { x: left, y: top, width: right - left, height: bottom - top };
 }

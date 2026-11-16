@@ -482,6 +482,30 @@ describe('Mermaid compat — Phase 3: stateDiagram-v2', () => {
     expect(model.transitions.map((t) => t.label)).toEqual(['start', 'stop']);
   });
 
+  // C9 (docs review v3): `Idle --> Running : start` + `Running --> Idle : stop` drew
+  // BOTH transitions down the same line between the same two ports, so the two
+  // labels printed over each other ("stop" over "start"). Since the import lays
+  // out as Mermaid does (dsl/mermaid/import-layout.ts), the pair is two curves
+  // side by side, each label on its own — as Mermaid draws it — rather than the
+  // return swung round another side of the boxes.
+  it('a transition and its REVERSE take different routes (their labels cannot collide)', () => {
+    const r = imp('stateDiagram-v2\n  [*] --> Idle\n  Idle --> Running : start\n  Running --> Idle : stop');
+    const link = (from: string, to: string) =>
+      r.diagram.getLinks().find((l) => l.sourceNodeId === from && l.targetNodeId === to)!;
+    const there = link('Idle', 'Running');
+    const back = link('Running', 'Idle');
+    const ports = (l: typeof there) => [l.sourcePortId, l.targetPortId].sort().join(',');
+    expect(ports(back)).not.toBe(ports(there));
+    // …and the lines themselves are apart: no point of one is a point of the other.
+    const key = (p: { x: number; y: number }) => `${Math.round(p.x)},${Math.round(p.y)}`;
+    const thereKeys = new Set(there.points.map(key));
+    expect(back.points.some((p) => thereKeys.has(key(p)))).toBe(false);
+    // …and so are their labels.
+    expect(there.labels[0].position).not.toBeUndefined();
+    const at = (l: typeof there) => l.getPointAtPosition(l.labels[0].position)!;
+    expect(Math.hypot(at(there).x - at(back).x, at(there).y - at(back).y)).toBeGreaterThan(30);
+  });
+
   it('a COMPOSITE state becomes a group, and its `[*]` is scoped to it', () => {
     const r = imp(
       'stateDiagram-v2\n' +
@@ -517,7 +541,10 @@ describe('Mermaid compat — Phase 3: stateDiagram-v2', () => {
     // bare-state rule: `note right of A / hello / end note` minted a state
     // literally called "hello".
     const r = imp('stateDiagram-v2\n  A --> B\n  note right of A\n    hello\n  end note');
-    expect(nodeIds(r.diagram)).toEqual(['A', 'B']);
+    // The STATES are A and B; "hello" is drawn as a note box beside A, not minted as a state.
+    const notes = r.diagram.getNodes().filter((n) => n.getMetadata('stateNote') === true);
+    expect(nodeIds(r.diagram).filter((id) => !notes.some((n) => n.id === id))).toEqual(['A', 'B']);
+    expect(notes.map((n) => n.getLabel())).toEqual(['hello']);
     expect(parseMermaidState('stateDiagram-v2\n  A --> B\n  note right of A\n    hello\n  end note').notes)
       .toEqual([{ position: 'right of', target: 'A', text: 'hello' }]);
   });

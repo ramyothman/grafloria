@@ -3,6 +3,7 @@
 import { EventEmitter } from 'eventemitter3';
 import { SerializedEntity } from '../types';
 import { generateId, generateUUID, deepClone } from '../utils';
+import { engineNow } from '../utils/deterministic';
 
 export interface ChangeEntry {
   timestamp: number;
@@ -80,18 +81,18 @@ export abstract class DiagramEntity {
     this.uuid = uuid || generateUUID();
     this.metadata = new Map();
     this.emitter = new EventEmitter();
-    this._dirtyTimestamp = Date.now(); // Set initial timestamp
+    this._dirtyTimestamp = engineNow(); // Set initial timestamp
   }
 
   /**
-   * Check if entity has been modified since last render (Phase 5.2)
+   * Check if entity has been modified since last render
    */
   get isDirty(): boolean {
     return this._isDirty;
   }
 
   /**
-   * Mark entity as dirty (needs re-render) (Phase 5.2)
+   * Mark entity as dirty (needs re-render)
    */
   markDirty(reason?: string): void {
     this.assertNotDisposed(); // Phase 5.4: Prevent operations on disposed entities
@@ -106,7 +107,7 @@ export abstract class DiagramEntity {
     mutationEpoch++;
 
     this._isDirty = true;
-    this._dirtyTimestamp = Date.now();
+    this._dirtyTimestamp = engineNow();
 
     if (reason) {
       this._dirtyReasons.add(reason);
@@ -119,7 +120,7 @@ export abstract class DiagramEntity {
   }
 
   /**
-   * Mark entity as clean (rendered) (Phase 5.2)
+   * Mark entity as clean (rendered)
    */
   markClean(): void {
     this.assertNotDisposed(); // Phase 5.4
@@ -137,21 +138,21 @@ export abstract class DiagramEntity {
   }
 
   /**
-   * Get reasons why entity is dirty (Phase 5.2)
+   * Get reasons why entity is dirty
    */
   getDirtyReasons(): string[] {
     return Array.from(this._dirtyReasons);
   }
 
   /**
-   * Get timestamp when entity was marked dirty (Phase 5.2)
+   * Get timestamp when entity was marked dirty
    */
   getDirtyTimestamp(): number | null {
     return this._dirtyTimestamp;
   }
 
   /**
-   * Begin batch update (Phase 5.2)
+   * Begin batch update
    * Delays dirty marking until batch ends
    */
   beginBatch(): void {
@@ -159,7 +160,7 @@ export abstract class DiagramEntity {
   }
 
   /**
-   * End batch update (Phase 5.2)
+   * End batch update
    * Marks dirty once if any changes occurred
    */
   endBatch(): void {
@@ -211,7 +212,7 @@ export abstract class DiagramEntity {
     if (oldValue === newValue) return;
 
     const entry: ChangeEntry = {
-      timestamp: Date.now(),
+      timestamp: engineNow(),
       property,
       oldValue: this.cloneValue(oldValue),
       newValue: this.cloneValue(newValue),
@@ -381,14 +382,14 @@ export abstract class DiagramEntity {
   abstract serialize(): SerializedEntity;
 
   /**
-   * Check if entity has been disposed (Phase 5.4)
+   * Check if entity has been disposed
    */
   isDisposed(): boolean {
     return this._disposed;
   }
 
   /**
-   * Check if entity is not disposed and throw if it is (Phase 5.4)
+   * Check if entity is not disposed and throw if it is
    */
   protected assertNotDisposed(): void {
     if (this._disposed) {
@@ -397,7 +398,7 @@ export abstract class DiagramEntity {
   }
 
   /**
-   * Dispose entity and clean up resources (Phase 5.4)
+   * Dispose entity and clean up resources
    * Prevents memory leaks by:
    * - Removing all event listeners
    * - Clearing change log

@@ -5,12 +5,13 @@ import type {
   EdgeSpec,
   NodeSpec,
   StaticRenderOptions,
-  StaticRenderResult,
-} from '@grafloria/renderer';
+  StaticRenderResult, GroupSpec } from '@grafloria/renderer';
 import { defineGrafloriaFlow } from './grafloria-flow-element';
 import type { DashboardSpec } from './dashboard-kit';
+import type { LoadedDiagramSpec } from './load';
 import { registerNodeType, registeredNodeTypes, getNodeType } from './node-type-registry';
 import type { NodeTypeRenderer } from './node-type-registry';
+import { teardownInOrder } from './teardown';
 
 /**
  * `Grafloria` — the Mermaid-shaped top-level API.
@@ -44,6 +45,13 @@ import type { NodeTypeRenderer } from './node-type-registry';
 export interface DiagramSpec {
   nodes?: NodeSpec[];
   edges?: EdgeSpec[];
+  /** Zones around some boxes, each with its own frame and caption. See `GroupSpec`. */
+  groups?: GroupSpec[];
+  /**
+   * `'architecture'`: compose the drawing — zones as regions, boxes sized to their
+   * words in rows, straight lines where boxes line up. Positions are not needed.
+   */
+  layout?: 'architecture';
 }
 
 /**
@@ -54,14 +62,38 @@ export interface KitDiagramSpec {
   nodes: Array<Record<string, unknown>>;
   edges: Array<Record<string, unknown>>;
   renderCustomNode?: (node: unknown, host: HTMLElement) => void;
+  /** Called before a custom node's host is removed (dashboard(): releases a widget's host). */
+  removeCustomNode?: (nodeId: string, host: HTMLElement) => void;
   finalize?: (api: unknown) => void;
 }
 
-// A kit spec (dashboard(), erDiagram(), umlDiagram(), …) IS a render spec —
-// `render(kit({…}), host)` is the documented one-liner, so the type says so.
-export type RenderSpec = DiagramSpec | DashboardSpec | KitDiagramSpec | string;
+/**
+ * Everything `render()` mounts: a plain {@link DiagramSpec}, a kit spec
+ * (`dashboard()`, `erDiagram()`, `umlDiagram()`, …), a reopened document from
+ * `fromDocument()`, or the JSON string of a plain spec.
+ */
+export type RenderSpec = DiagramSpec | DashboardSpec | KitDiagramSpec | LoadedDiagramSpec | string;
 
 export type RenderOptions = Omit<CreateDiagramOptions, 'nodes' | 'edges'>;
+
+/**
+ * The keyboard a kit spec asks for, joined with the caller's. When the spec
+ * brings a `beforeKey` (a dashboard with `userHistory: false`), it stays, and
+ * a caller's own `beforeKey` is asked after it — only about a key the spec
+ * let through, since a key it cancels never runs. `keyboard: false` from the
+ * caller still turns every key off; `true` is the default and changes
+ * nothing. Without a spec hook, the caller's keyboard wins as any option does.
+ */
+function joinKeyboard(fromSpec: RenderOptions['keyboard'], fromCaller: RenderOptions['keyboard']): RenderOptions['keyboard'] {
+  const specKey = typeof fromSpec === 'object' ? fromSpec.beforeKey : undefined;
+  if (!specKey || fromCaller === false) return fromCaller ?? fromSpec;
+  if (typeof fromCaller !== 'object') return fromSpec;
+  const callerKey = fromCaller.beforeKey;
+  return {
+    ...fromCaller,
+    beforeKey: (event, action) => (specKey(event, action) === false ? false : callerKey?.(event, action)),
+  };
+}
 
 /**
  * Mount `spec` into `target` and return the live instance.
@@ -91,10 +123,28 @@ export function render(
   // flow into createDiagram's NodeInput[] the same way.
   const parsed = (typeof spec === 'string' ? parseSpec(spec) : spec) as DiagramSpec;
 
+  // A kit spec may ask for instance options of its own — a fluid dashboard
+  // pins the zoom range so its layout can never become a scaled picture. The
+  // caller's explicit options still win, but for a key hook, which both keep.
+  const fromSpec = (parsed as { renderOptions?: Partial<RenderOptions> }).renderOptions ?? {};
+  const keyboard = joinKeyboard(fromSpec.keyboard, options.keyboard);
+
+  // Teardown is not a choice between painters: a kit spec releases the hosts
+  // it painted (dashboard() tells `unmountWidget`) whoever else listens, and a
+  // caller's own `removeCustomNode` still runs after it (teardownInOrder).
+  const removeCustomNode = teardownInOrder(
+    (parsed as { removeCustomNode?: RenderOptions['removeCustomNode'] }).removeCustomNode,
+    options.removeCustomNode
+  );
+
   const instance = createDiagram(element, {
+    ...fromSpec,
     ...options,
+    ...(keyboard !== undefined ? { keyboard } : {}),
     nodes: parsed.nodes ?? [],
     edges: parsed.edges ?? [],
+    ...(parsed.groups ? { groups: parsed.groups } : {}),
+    ...(parsed.layout ? { layout: parsed.layout } : {}),
     // Wire the global registry in, so `registerNodeType` works for the tiny API
     // exactly as it does for `<grafloria-flow>` — unless the caller supplies their
     // own. A KIT SPEC may also carry its own painter (dashboard() does: every
@@ -105,6 +155,7 @@ export function render(
       options.renderCustomNode ??
       (parsed as { renderCustomNode?: RenderOptions['renderCustomNode'] }).renderCustomNode ??
       ((node, host) => getNodeType(node.type)?.(node, host)),
+    ...(removeCustomNode ? { removeCustomNode } : {}),
   });
 
   // Diagram-kit specs (erDiagram/umlDiagram) carry a `finalize(api)` for the
@@ -120,10 +171,33 @@ export function render(
     }
   }
 
+  // A kit that hands out a live handle (dashboard()) registers process-wide
+  // canvas tools and listens on `element`, which outlives the instance. Disposing
+  // the instance must dispose the handle too: left behind, the old board's tools
+  // kept claiming presses on the next board mounted in the same element (React
+  // StrictMode mounts twice), so its drags went to a dead history, its dividers
+  // did nothing and its section chrome was painted twice.
+  const kitHandle = (spec as { handle?: { dispose?: () => void } } | null)?.handle;
+  if (kitHandle && typeof kitHandle.dispose === 'function') {
+    const disposeInstance = instance.dispose.bind(instance);
+    let disposed = false;
+    instance.dispose = () => {
+      if (!disposed) {
+        disposed = true;
+        try {
+          kitHandle.dispose?.();
+        } catch {
+          /* the instance still tears down */
+        }
+      }
+      disposeInstance();
+    };
+  }
+
   return instance;
 }
 
-/** Server-side render (Card 6). Re-exported so the tiny API is self-contained. */
+/** Server-side render. Re-exported so the tiny API is self-contained. */
 export function renderStatic(options: StaticRenderOptions = {}): StaticRenderResult {
   return renderToStaticSVG(options);
 }

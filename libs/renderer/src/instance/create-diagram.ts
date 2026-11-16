@@ -1,7 +1,11 @@
-import { DiagramEngine, getMutationEpoch, exportDiagramText, importDiagramText, CommentStore } from '@grafloria/engine';
+import { DiagramEngine, getMutationEpoch, exportDiagramText, CommentStore, layoutArchitecture } from '@grafloria/engine';
+import type { ClipboardData } from '@grafloria/engine';
+import { canvasTextMeasure } from '../svg/text-measure';
 import { CommentOverlayController } from '../comments/comment-overlay';
+import { textKitFor } from './text-kits';
 import type {
   DiagramModel,
+  GroupModel,
   LinkModel,
   LODLevel,
   NodeModel,
@@ -10,8 +14,9 @@ import type {
   ImportTextResult,
 } from '@grafloria/engine';
 import type { Theme } from '../types/theme.types';
-import type { SVGRendererConfig } from '../types/renderer.interface';
+import type { HighlightConnectedOptions, LODMode, SVGRendererConfig } from '../types/renderer.interface';
 import type { Rectangle } from '../types/geometry.types';
+import { contentBounds } from './content-bounds';
 import type { ExportFormat, ExportOptions } from '../types/renderer.interface';
 import type { ColorMode, ThemeSet } from '../themes/color-mode';
 import type { TokenBridge } from '../themes/token-bridge';
@@ -19,21 +24,37 @@ import type { GovernorState } from '../perf/quality-governor';
 import type { AnimationService } from '../services/animation.service';
 import type { SvgExportResult } from '../export/svg-export';
 import type { PdfExportResult } from '../export/pdf/pdf-export';
-import type { CustomNodeCapture } from '../export/custom-nodes';
-import { captureCustomNodeHost, stripResolvedImageWarnings } from '../export/capture-host';
-import { collectAssetUrls, fetchAssetsTiered, inlineAssets } from '../export/assets';
+import { createExportPipeline } from '../export/capture-pipeline';
 import type { VNode } from '../types/vnode.types';
 import { SVGRenderer } from '../svg/svg-renderer';
+import type { FrameCoverage } from '../svg/svg-renderer';
 import type { DiagramRegistry } from '../ext/diagram-registry';
 import { VNodePatcher } from '../vnode/patch';
 import { InteractionController } from '../interaction/interaction-controller';
+import { HighlighterController, DEFAULT_HIGHLIGHTER_CONFIG, type Highlighter, type HighlighterConfig } from '../interaction/highlighters';
 import { ViewportController } from '../viewport/viewport-controller';
+import type { Feature, FeatureContext } from './workflow/feature';
+import { installConnectReason } from './workflow/connect-reason';
+import { createClipboardApi } from './workflow/clipboard';
+import { installRunOverlay } from './workflow/run-overlay';
+import { insertNodeOnLink } from './workflow/insert-on-link';
+import { placeFlow, tidyFlow } from './workflow/flow-place';
+import { createNodeTemplates, installNodeTemplates } from './workflow/node-templates';
+import { installAffordances } from './workflow/affordances';
+import type { AffordanceOptions, LinkAddRequest, PortAddRequest } from './workflow/affordances';
+import type { NodeTemplate } from './workflow/node-templates';
+import type { FlowPlaceOptions, PlaceNodesOptions } from './workflow/flow-place';
+import type { InsertNodeOnLinkOptions, InsertNodeOnLinkResult } from './workflow/insert-on-link';
+import type { RunOverlay, RunOverlayFeature } from './workflow/run-overlay';
+import type { ClipboardHooks, PasteOptions } from './workflow/clipboard';
 import type { CanvasRect, Unsubscribe } from '../viewport/viewport-controller';
 import { RenderScheduler } from './render-scheduler';
 import { DomEventBinder } from './dom-event-binder';
 import type { DomEventBinderOptions } from './dom-event-binder';
-import { applyEdges, applyNodes, toNodeSpec, toEdgeSpec } from './model-input';
-import type { EdgeSpec, NodeSpec } from './model-input';
+import { applyEdges, applyGroups, applyNodes, toNodeSpec, toEdgeSpec } from './model-input';
+import { loadTextInto } from './load-text';
+import type { EdgeWarning } from './model-input';
+import type { EdgeSpec, GroupSpec, NodeSpec } from './model-input';
 import {
   HTML_LAYER_CLASS,
   INSTANCE_ATTR,
@@ -49,6 +70,7 @@ import { isBrowser } from '../platform';
 import { HtmlHostCuller } from '../lazy/host-culling';
 import type { HostCullOptions } from '../lazy/host-culling';
 import type { ViewLifecycle } from '../lazy/view-lifecycle';
+import { ShapeAwareHighlighterController } from './highlighter-overlay';
 
 /**
  * `createDiagram()` — the headless instance factory.
@@ -72,6 +94,27 @@ export type NodeInput = NodeSpec | NodeModel;
 export type EdgeInput = EdgeSpec | LinkModel;
 
 export interface DiagramEventMap {
+  /**
+   * A connection drag (from a port, or its "+") ended over NOTHING. The host can
+   * offer the next step there; `world` is where, in diagram coordinates.
+   */
+  'connect:drop-empty': { nodeId: string | undefined; portId: string; world: { x: number; y: number }; clientPoint: { x: number; y: number } };
+  /** A single node was dragged and released over a link (`nodeDropOnLink`). Nothing changed; the host decides. */
+  'link:insert-request': { linkId: string; nodeId: string; clientPoint: { x: number; y: number } };
+  /**
+   * Something in the input did not land as written, and the instance carried on:
+   * an edge dropped because an end resolves to no port, or attached to a
+   * fallback port because the one it names does not exist. Warnings raised while
+   * `createDiagram` applies its initial spec arrive a microtask later, so a
+   * listener added right after it returns still hears them.
+   */
+  'renderer:warning': EdgeWarning;
+  /** The "+" on an unconnected output port was pressed (`affordances.portAdd`). */
+  'port:add-request': PortAddRequest;
+  /** The "+" at a hovered link's midpoint was pressed (`affordances.linkAdd`). */
+  'link:add-request': LinkAddRequest;
+  /** The delete button beside it was pressed (`affordances.linkDelete`). */
+  'link:delete-request': LinkAddRequest;
   'nodes:change': { nodes: NodeModel[] };
   'edges:change': { edges: LinkModel[] };
   'selection:change': { nodes: NodeModel[]; edges: LinkModel[] };
@@ -92,6 +135,12 @@ export type DiagramEventHandler<K extends DiagramEventName> = (
 export interface CreateDiagramOptions extends DomEventBinderOptions {
   nodes?: NodeInput[];
   edges?: EdgeInput[];
+  /**
+   * Zones: groups around some boxes, each with a frame of its own — fill,
+   * border, dash, a caption in a corner (the tinted regions of the diagrams AI
+   * tools draw). A live `GroupModel` passes through. See {@link GroupSpec}.
+   */
+  groups?: Array<GroupSpec | GroupModel>;
   theme?: Theme;
 
   /**
@@ -116,6 +165,48 @@ export interface CreateDiagramOptions extends DomEventBinderOptions {
    * anything set here, and `instanceId` is omitted because hydration owns it.
    */
   renderer?: Omit<SVGRendererConfig, 'instanceId'>;
+
+  /**
+   * Level of detail. `'document'` is for a STATIC FIGURE — a diagram in a page
+   * of documentation, fitted to its column, that the reader cannot zoom: it
+   * never sheds labels, arrowheads or anything else, at any zoom or size, and
+   * the quality governor is off. `'auto'` (default) lets the diagram's LOD
+   * policy follow the zoom. Wins over `renderer.lod`.
+   * See {@link SVGRendererConfig.lod}.
+   */
+  lod?: LODMode;
+
+  /**
+   * Select a node and its lines come forward in the page's ink while every other
+   * line fades back; a line of the selection that runs across another node is
+   * lifted above the cards and drawn dashed. Off by default; see
+   * {@link HighlightConnectedOptions}. Wins over `renderer.highlightConnected`.
+   * Switch it live with `setHighlightConnected()`.
+   */
+  highlightConnected?: boolean | HighlightConnectedOptions;
+
+  /**
+   * The OUTLINE LAYER Angular's canvas draws: an outline around the hovered node,
+   * the selected node, nodes with a validation issue, and the valid targets while
+   * a connection is drawn. `true` turns every kind on; an object turns kinds on or
+   * off one by one, over the defaults ({@link HighlighterConfig}). Off when unset,
+   * so an existing app is unchanged. Validation outlines show the engine's
+   * warnings — except "node type is not registered": the canvas draws every node
+   * (an unknown type as the fallback rectangle), so that one is left to
+   * `engine.validate()`. `{ showValidation: false }` keeps only hover and
+   * selection. Switch it live with `setHighlighterConfig()`.
+   */
+  highlighterConfig?: boolean | Partial<HighlighterConfig>;
+
+  /**
+   * Arrange the diagram on mount. `'architecture'` composes it the way AI tools
+   * hand-draw one: zones as regions on a grid, boxes sized to their words and
+   * aligned in rows, lines straight where boxes line up and bent in the gutters,
+   * a node's `near` note beside its target. Positions in the spec are not needed
+   * (and are overridden). The same layout runs from Mermaid with
+   * `%%grafloria:layout architecture`, or later with `engine.layout('architecture')`.
+   */
+  layout?: 'architecture';
 
   zoom?: number;
   minZoom?: number;
@@ -233,11 +324,59 @@ export interface CreateDiagramOptions extends DomEventBinderOptions {
   comments?: boolean | CommentStore;
   /** Viewer id for a `comments: true`-created store (default `'local'`). */
   commentsViewer?: string;
+
+  /**
+   * While a connection is dragged over a port that refuses it, show WHY beside
+   * that port: a host validator's reason string (`registerConnectionValidator`
+   * returning text) or a built-in rule's message (a port at its link limit, a
+   * duplicate link). Off by default. Styled by `.grafloria-connect-reason` and
+   * `--grafloria-connect-reason-bg` / `--grafloria-connect-reason-fg`.
+   */
+  connectionReasons?: boolean;
+
+  /**
+   * Keep the host's own clipboard format beside the diagram's. `onCopy` gets the
+   * diagram's payload after every copy/cut (keyboard or `copy()`/`cut()`);
+   * `onPaste` may answer one back before a paste. With this set, Ctrl/⌘ C and V
+   * go through these hooks; without it they run exactly as before.
+   */
+  clipboard?: ClipboardHooks;
+
+  /**
+   * Data-driven node TEMPLATES, one per node type: `(data, ctx) → { html, ports,
+   * size }`. Nodes of a templated type become HTML cards the template paints —
+   * and paints again whenever their data changes. Their ports and size come from
+   * the template, and a data edit through `SetNodeDataCommand` re-derives them in
+   * the SAME undo step, removing (and on undo restoring) wires on a removed port.
+   * An element marked `data-port="<port id>"` anchors that port level with it
+   * (see `anchorPorts`). A template may be an object with a `compact` form for
+   * zooms below `compactBelow`. Unset: nothing here runs.
+   */
+  nodeTemplates?: Record<string, NodeTemplate>;
+  /** Below this zoom, templated cards draw their `compact` form; hosts carry `data-lod`. */
+  compactBelow?: number;
+  /**
+   * Anchor a templated card's ports to its `[data-port]` elements: each port sits
+   * on its side's edge, level with its element, re-measured on content change,
+   * resize and font load. Default true when `nodeTemplates` is set.
+   */
+  anchorPorts?: boolean;
+
+  /**
+   * The "+" a flow editor shows where the next step can go: `portAdd` on every
+   * unconnected OUTPUT port, `linkAdd` / `linkDelete` at a hovered link's
+   * midpoint. They only emit (`port:add-request`, `link:add-request`,
+   * `link:delete-request`) — the host decides what happens — and never show
+   * while read-only. Off by default.
+   */
+  affordances?: AffordanceOptions;
 }
 
 export interface DiagramInstance {
   setNodes(nodes: NodeInput[]): void;
   setEdges(edges: EdgeInput[]): void;
+  /** Reconcile the zones (groups) — add, restyle, remove. Removing a zone keeps its boxes. */
+  setGroups(groups: Array<GroupSpec | GroupModel>): void;
   getModel(): DiagramModel;
   getEngine(): DiagramEngine;
   /** The comment store, when `comments` was enabled; `null` otherwise. */
@@ -263,6 +402,19 @@ export interface DiagramInstance {
   getColorMode(): ColorMode | undefined;
   /** Re-point Grafloria's CSS variables at the host design system's tokens. */
   setTokenBridge(bridge: TokenBridge | null | undefined): void;
+
+  /**
+   * Turn the selected nodes' line highlight on (`true`, or options) or off
+   * (`false`) — see `CreateDiagramOptions.highlightConnected`. Repaints.
+   */
+  setHighlightConnected(value: boolean | HighlightConnectedOptions): void;
+  /**
+   * Turn the outline layer on (`true`, or an object of kinds) or off (`false`) —
+   * see `CreateDiagramOptions.highlighterConfig`. Repaints.
+   */
+  setHighlighterConfig(value: boolean | Partial<HighlighterConfig>): void;
+  /** The current `highlightConnected` setting (`false` when off). */
+  getHighlightConnected(): boolean | HighlightConnectedOptions;
 
   /**
    * Export the CURRENT view. `'svg'` returns SVG source; `'png' | 'jpeg' |
@@ -294,6 +446,15 @@ export interface DiagramInstance {
 
   /** Frame all content. */
   fitView(padding?: number): void;
+
+  /**
+   * World bounds of everything the canvas draws — boxes, lines, edge labels,
+   * group frames: what `fitView` fits. A host sizing a FIGURE (a diagram in a
+   * page, fitted to its column) takes its height from this aspect ratio, after
+   * `loadText` — a Mermaid import measures its words in the page, so the model
+   * parsed on its own has another shape. Null when there is nothing to draw.
+   */
+  getContentBounds(): Rectangle | null;
 
   /** Queue a repaint (coalesced into one frame). */
   render(): void;
@@ -345,7 +506,13 @@ export interface DiagramInstance {
   /**
    * Parse Mermaid-compatible text (sidecar-aware) and reconcile it INTO the
    * live diagram through the same spec reconciler `setNodes`/`setEdges` use —
-   * listeners, plugins, and the renderer all stay attached.
+   * listeners, plugins, and the renderer all stay attached. The diagram type
+   * comes along, so `exportText` writes it back in the grammar it came in.
+   *
+   * THROWS — and leaves the canvas exactly as it was — when the text is empty,
+   * is a Mermaid type the canvas cannot draw (`sequenceDiagram`, `gantt`, …), or
+   * has a line the parser could not read (a typo'd header, a broken shape). The
+   * message names the line.
    */
   loadText(text: string, options?: ImportTextOptions): ImportTextResult;
 
@@ -356,6 +523,89 @@ export interface DiagramInstance {
    * threshold). Custom node components receive this as the `dragging` prop.
    */
   getDraggingNodeIds(): string[];
+
+  /**
+   * Read-only, live, as ONE switch. On: no moving, connecting, deleting,
+   * resizing, pasting or undoing from the keyboard, no "+" affordances, no
+   * editing chrome. Kept: selection, click, double-click (`node:doubleclick`
+   * still fires, so a viewer can open a step), hover, pan/zoom and the run
+   * overlay. The DOCUMENT is locked too: a command executed through the engine,
+   * undo, or a direct model edit is refused. The instance's own input
+   * (`setNodes`/`setEdges`/`setGroups`/`loadText`) still applies, so a read-only
+   * viewer follows its data. Turning it off lifts only the lock it set (an
+   * engine VIEW mode stays). The container carries `data-readonly` while it is
+   * on. Starts from the `readonly` option.
+   */
+  setReadonly(readonly: boolean): void;
+  /** Is the view read-only — the `readonly` option / `setReadonly`, or the document's own lock? */
+  isReadonly(): boolean;
+
+  /**
+   * Copy the selection to the diagram's clipboard; resolves with the payload
+   * (plain JSON), or null when nothing was selected. Calls `clipboard.onCopy`.
+   */
+  copy(): Promise<ClipboardData | null>;
+  /** Copy, then delete the selection — ONE undo step. Null when nothing was cut (or read-only). */
+  cut(): Promise<ClipboardData | null>;
+  /**
+   * Paste `data` if given, else what `clipboard.onPaste` answers, else the last
+   * copy. Resolves false when there was nothing to paste (or read-only).
+   */
+  paste(data?: ClipboardData, options?: PasteOptions): Promise<boolean>;
+
+  /**
+   * Draw a RUN on the flow without making it part of the document: per node a
+   * status frame (`idle | pending | running | completed | error | warning`) and
+   * an optional badge, per link a label chip ("2 items") and an optional moving
+   * dash. REPLACES the previous overlay; repaints immediately, so it is cheap to
+   * call many times a second as a run streams in. Never enters undo,
+   * serialization or collab. Styled by `.grafloria-run-*` classes and
+   * `--grafloria-run-<status>` variables.
+   */
+  setOverlay(overlay: RunOverlay): void;
+  /** Remove the run overlay. */
+  clearOverlay(): void;
+  /** The overlay as last set (a copy). */
+  getOverlay(): RunOverlay;
+
+  /**
+   * Replace the link A→B with A→N→B as ONE undo step: N (built from `node`, the
+   * same spec `render()` takes) lands in the gap, its entry port level with A's,
+   * and B and what lies downstream shift along the flow only as far as N needs.
+   * Undo restores A→B exactly — the same link id, labels and style. Resolves
+   * null when the link (or a named port) does not exist.
+   */
+  insertNodeOnLink(linkId: string, node: NodeSpec, options?: InsertNodeOnLinkOptions): Promise<InsertNodeOnLinkResult | null>;
+
+  /**
+   * Tidy the whole flow — a tree in OUTPUT PORT ORDER (an If's `true` branch
+   * above its `false` one, a Switch's outputs top to bottom), merges to the right
+   * of every branch that feeds them, nodes with no links (notes) left alone and
+   * kept clear. Animated (unless `animate: false` or reduced motion), ONE undo
+   * step. Resolves the ids that moved.
+   */
+  tidy(options?: FlowPlaceOptions): Promise<string[]>;
+  /**
+   * Place only `ids`; every other node stays put. Each goes one step along the
+   * flow from its parent (`after`, else the step linking into it), in its port's
+   * slot among the parent's children, nudged clear of what is there. Animated,
+   * ONE undo step. Resolves the ids that moved.
+   */
+  placeNodes(ids: string[], options?: PlaceNodesOptions): Promise<string[]>;
+
+  /**
+   * visio-depth — open the in-place label editor programmatically: a node's
+   * label (`{ type: 'node', nodeId }`) or a link label
+   * (`{ type: 'link-label', linkId, labelIndex }`). The seam a host's
+   * context-menu Rename / F2 binding uses; the same editor + undoable commit
+   * that double-click opens. `seed` replaces the text the editor opens with
+   * (type-to-replace). Returns false when the target is missing, not editable,
+   * or the instance is readonly.
+   */
+  beginLabelEdit(
+    target: { type: 'node' | 'link-label'; nodeId?: string; linkId?: string; labelIndex?: number },
+    opts?: { seed?: string }
+  ): boolean;
 
   /**
    * THIS diagram's contribution registry — shapes, named styles, link/label
@@ -422,8 +672,33 @@ export function createDiagram(
   // Absent means "I am not managing this" — NOT "make it empty". A host that
   // really wants to clear the diagram passes `nodes: []` explicitly, which still
   // works.
+  // The camera does not exist yet when the first nodes are prepared: zoom 1 until it does.
+  let zoomNow: () => number = () => 1;
+  // Node templates go in BEFORE the nodes: a templated node must have its
+  // template's ports by the time the edges (which may name them) are applied.
+  const nodeTemplates = options.nodeTemplates
+    ? createNodeTemplates(
+        { templates: options.nodeTemplates, compactBelow: options.compactBelow, anchorPorts: options.anchorPorts },
+        () => zoomNow()
+      )
+    : null;
+  let stopTemplates: (() => void) | null = null;
+  if (nodeTemplates) {
+    model.setNodeTemplateResolver(nodeTemplates.resolve);
+    for (const node of model.getNodes()) nodeTemplates.prepare(model, node);
+    stopTemplates = model.on('node:added', (node: NodeModel) => nodeTemplates.prepare(model, node)) as unknown as () => void;
+  }
+
   if (options.nodes) applyNodes(model, options.nodes);
-  if (options.edges) applyEdges(model, options.edges);
+  // Zones after their boxes (membership needs the nodes), before the lines.
+  if (options.groups) applyGroups(model, options.groups);
+  // Warnings from the initial spec are held until listeners can exist.
+  const earlyWarnings: EdgeWarning[] = [];
+  let warnEdge: (w: EdgeWarning) => void = (w) => earlyWarnings.push(w);
+  if (options.edges) applyEdges(model, options.edges, (w) => warnEdge(w));
+  if (options.layout === 'architecture') layoutArchitecture(model, { measureText: canvasTextMeasure() });
+
+  zoomNow = () => viewport.getZoom();
 
   // -- camera -----------------------------------------------------------------
   const rect0 = container.getBoundingClientRect();
@@ -470,6 +745,8 @@ export function createDiagram(
       colorMode: options.colorMode ?? options.renderer?.colorMode,
       themes: options.themes,
       tokenBridge: options.tokenBridge,
+      highlightConnected: options.highlightConnected ?? options.renderer?.highlightConnected,
+      lod: options.lod ?? options.renderer?.lod,
       // "My picture improved with no model change — repaint me." Fired by the
       // async route solver's refinements and by motion-stable routing's settle
       // frame (a tween's provisional routes re-deciding once motion stops).
@@ -493,6 +770,97 @@ export function createDiagram(
   // exactly what it did before this line existed.
   if (options.viewLifecycle) renderer.setViewLifecycle(options.viewLifecycle);
   const patcher = new VNodePatcher({ document: doc });
+  // highlightConnected: the lines of the selection that cross a card are drawn
+  // AGAIN above every card — in an overlay at the end of the HTML layer, which
+  // sits over the SVG and over custom-node hosts and carries the camera. Its own
+  // patcher, so the SVG layer's per-frame stats stay the SVG layer's.
+  const overlayPatcher = new VNodePatcher({ document: doc });
+  let overlayHost: HTMLElement | null = null;
+  const syncLineOverlay = (): void => {
+    const tree = renderer.getLineOverlay();
+    if (!tree) {
+      overlayHost?.remove();
+      overlayHost = null;
+      return;
+    }
+    if (!overlayHost || overlayHost.parentNode !== layers.html) {
+      overlayHost = doc.createElement('div');
+      overlayHost.className = 'grafloria-line-overlay';
+      overlayHost.setAttribute('aria-hidden', 'true');
+      // z-index 1: above node hosts appended after it (they carry none).
+      overlayHost.setAttribute('style', 'position:absolute;left:0;top:0;width:0;height:0;overflow:visible;pointer-events:none;z-index:1');
+      layers.html.appendChild(overlayHost);
+    }
+    overlayPatcher.reconcile(overlayHost, tree);
+  };
+
+  // -- the outline layer (highlighterConfig) ------------------------------------
+  // The same controller Angular's canvas uses, so the outlines are the same ones;
+  // drawn like the line overlay, in world units inside the HTML layer, which
+  // carries the camera — a pan or zoom moves them with the picture for free.
+  // No "not registered" outline: the canvas draws every node — see
+  // ShapeAwareHighlighterController.
+  const highlighter = new ShapeAwareHighlighterController();
+  let highlighterOn = false;
+  const highlighterPatcher = new VNodePatcher({ document: doc });
+  let highlighterHost: HTMLElement | null = null;
+  /** The colours of Angular's canvas, as presentation attributes so a host's CSS on the class wins. */
+  const OUTLINE_STROKE: Record<string, string> = {
+    hover: '#60a5fa',
+    selection: '#3b82f6',
+    'connect-target': '#10b981',
+    error: '#ef4444',
+    warning: '#f59e0b',
+  };
+  const outlineVNode = (h: Highlighter): VNode => {
+    const stroke = OUTLINE_STROKE[h.kind === 'validation' ? (h.severity ?? 'warning') : h.kind] ?? '#3b82f6';
+    const common = {
+      className: h.className,
+      fill: 'none',
+      stroke,
+      'vector-effect': 'non-scaling-stroke',
+      ...(h.kind === 'selection' ? { strokeDasharray: '4 3' } : {}),
+      ...(h.kind === 'hover' ? { opacity: 0.9 } : {}),
+      ...(h.severity ? { 'data-severity': h.severity } : {}),
+    };
+    const title: VNode[] = h.message ? [{ type: 'title', key: `${h.id}-t`, props: { textContent: h.message }, children: [] }] : [];
+    if (h.bounds) {
+      const b = h.bounds;
+      const rotate = h.rotation ? { transform: `rotate(${h.rotation}, ${b.x + b.width / 2}, ${b.y + b.height / 2})` } : {};
+      return { type: 'rect', key: h.id, props: { ...common, ...rotate, x: b.x, y: b.y, width: b.width, height: b.height, strokeWidth: 2 }, children: title };
+    }
+    return { type: 'polyline', key: h.id, props: { ...common, points: (h.points ?? []).map((p) => `${p.x},${p.y}`).join(' '), strokeWidth: 6 }, children: title };
+  };
+  const syncHighlighterOverlay = (): void => {
+    if (!highlighterOn) {
+      highlighterHost?.remove();
+      highlighterHost = null;
+      return;
+    }
+    if (!highlighterHost || highlighterHost.parentNode !== layers.html) {
+      highlighterHost = doc.createElement('div');
+      highlighterHost.className = 'grafloria-highlighter-overlay';
+      highlighterHost.setAttribute('aria-hidden', 'true');
+      // z-index 2: above the cards and above the line overlay (1).
+      highlighterHost.setAttribute('style', 'position:absolute;left:0;top:0;width:0;height:0;overflow:visible;pointer-events:none;z-index:2');
+      layers.html.appendChild(highlighterHost);
+    }
+    highlighterPatcher.reconcile(highlighterHost, {
+      type: 'svg',
+      key: 'grafloria-highlighter-overlay',
+      props: { width: 1, height: 1, style: { position: 'absolute', left: '0px', top: '0px', overflow: 'visible', pointerEvents: 'none' } },
+      children: highlighter.compute(engine).map(outlineVNode),
+    });
+  };
+  /** Apply a setting; the next frame draws it (validation is refreshed when the layer comes on). */
+  const applyHighlighterConfig = (value: boolean | Partial<HighlighterConfig> | undefined): void => {
+    const was = highlighterOn;
+    highlighterOn = value !== undefined && value !== false;
+    highlighter.updateConfig({ ...DEFAULT_HIGHLIGHTER_CONFIG, ...(typeof value === 'object' ? value : {}) });
+    if (highlighterOn && !was) highlighter.refreshValidation(engine);
+    if (!highlighterOn) highlighter.clearValidation();
+  };
+  applyHighlighterConfig(options.highlighterConfig);
 
   // -- events -----------------------------------------------------------------
   const listeners = new Map<string, Set<Listener>>();
@@ -501,6 +869,46 @@ export function createDiagram(
     if (!set) return;
     // Copy: a handler is allowed to unsubscribe itself.
     for (const listener of [...set]) (listener as (p: unknown) => void)(payload);
+  };
+
+  warnEdge = (w) => emit('renderer:warning', w);
+  if (earlyWarnings.length) {
+    const held = earlyWarnings.splice(0);
+    queueMicrotask(() => held.forEach((w) => emit('renderer:warning', w)));
+  }
+
+  // -- selection:change: ONE per gesture, carrying the final selection ---------
+  // Two channels announce a selection change: the model's `selection:changed`
+  // (one per mutation) and the event binder's own emit at the end of a gesture.
+  // Both used to reach listeners, so one click fired twice — and the first was
+  // STALE: `selectNode` fires the model event before the binder deselects the
+  // edge that was selected ({n:1,e:1} then {n:1,e:0}). Every framework binding
+  // forwards these, so React/Vue/Qwik selection callbacks fired twice per click.
+  //
+  // Now both go through one gate. While the binder is handling a gesture (it
+  // brackets each DOM event, and holds a press until its release) an emission is
+  // only OWED; it is paid once, with the selection as it then stands, when the
+  // outermost batch closes. Outside any gesture — selectNode()/clearSelection()
+  // from code — it emits immediately, as it always did.
+  //
+  // A gesture that ends where it started — a click on the node that already is
+  // the selection, a click on empty canvas with nothing selected — owes nothing:
+  // the selection is compared with the one the gesture began with, and only a
+  // real change is announced.
+  let selectionBatchDepth = 0;
+  let selectionOwed = false;
+  let selectionAtGestureStart = '';
+  const selectedEdges = (): LinkModel[] => model.getLinks().filter((l: LinkModel) => l.state === 'selected');
+  const selectionKey = (): string =>
+    model.getSelectedNodes().map((n: NodeModel) => n.id).join('\u0000') +
+    '\u0001' +
+    selectedEdges().map((l: LinkModel) => l.id).join('\u0000');
+  const emitSelectionNow = (): void => {
+    emit('selection:change', { nodes: model.getSelectedNodes(), edges: selectedEdges() });
+  };
+  const announceSelection = (): void => {
+    if (selectionBatchDepth > 0) selectionOwed = true;
+    else emitSelectionNow();
   };
 
   // -- comments ---------------------------------------------------------------
@@ -541,10 +949,159 @@ export function createDiagram(
       interaction,
       getRect,
       requestRender: () => scheduler.schedule(),
-      emit,
+      // The clipboard keys go through the instance's copy/cut/paste only when the
+      // host asked for its hooks or owns the keyboard; otherwise the binder's own
+      // engine copy/paste runs, exactly as before.
+      // connection.snapToNode / nodeDropOnLink: the marks the drag shows.
+      markConnectSnap: (nodeId, verdict) => {
+        for (const [id, host] of nodeHosts) {
+          if (id === nodeId) host.setAttribute('data-connect-snap', verdict ?? 'accept');
+          else if (host.hasAttribute('data-connect-snap')) host.removeAttribute('data-connect-snap');
+        }
+        renderer.setConnectSnap(nodeId, verdict);
+        scheduler.schedule();
+      },
+      markDropLink: (linkId) => {
+        renderer.setDropTargetLink(linkId);
+        scheduler.schedule();
+      },
+      clipboardKey:
+        options.clipboard || typeof options.keyboard === 'object'
+          ? (action) => {
+              void clipboardApi[action]();
+              return true;
+            }
+          : undefined,
+      // The binder's selection:change is the same announcement as the model's:
+      // route it through the gate (its payload is re-read at emit time).
+      emit: (event, payload) => (event === 'selection:change' ? announceSelection() : emit(event, payload)),
+      beginSelectionBatch: () => {
+        if (selectionBatchDepth === 0) selectionAtGestureStart = selectionKey();
+        selectionBatchDepth++;
+      },
+      endSelectionBatch: () => {
+        if (selectionBatchDepth === 0) return;
+        selectionBatchDepth--;
+        if (selectionBatchDepth === 0 && selectionOwed) {
+          selectionOwed = false;
+          if (selectionKey() !== selectionAtGestureStart) emitSelectionNow();
+        }
+      },
     },
     options
   );
+
+  // -- the clipboard: copy()/cut()/paste() and the host's hooks ----------------
+  const clipboardApi = createClipboardApi(engine, options.clipboard, {
+    changed: () => scheduler.schedule(),
+    isReadonly: () => binder.readonlyNow(),
+  });
+
+  // -- workflow-editor features (each opt-in; see ./workflow/feature.ts) -------
+  /** Set by a feature's `invalidate()`; cleared when the next frame starts. */
+  let featureRepaintOwed = false;
+  const featureCtx: FeatureContext = {
+    doc,
+    container,
+    htmlLayer: layers.html,
+    engine,
+    getModel: () => engine.getDiagram() ?? model,
+    viewport,
+    schedule: () => scheduler.schedule(),
+    invalidate: () => {
+      featureRepaintOwed = true;
+      renderer.invalidateFrame();
+      scheduler.schedule();
+    },
+    emit: (event, payload) => emit(event, payload),
+    isReadonly: () => binder.readonlyNow(),
+    startConnection: (portId, clientX, clientY) => binder.startConnectionFromPort(portId, clientX, clientY),
+  };
+  // Read-only: the binder refuses gestures, the renderer drops editing chrome,
+  // the root says so for host CSS — and the DOCUMENT is locked too, so a
+  // command executed through the engine (or a direct model edit) is refused
+  // rather than editing a "read-only" diagram behind the view's back.
+  //
+  // Only a lock THIS switch set is lifted by it: a document locked by the
+  // engine's VIEW/PRESENTATION mode stays locked when the view is unlocked.
+  let viewLockedModel = false;
+  const applyReadonly = (readonly: boolean): void => {
+    binder.setReadonly(readonly);
+    renderer.setViewReadonly(readonly);
+    if (readonly) container.setAttribute('data-readonly', '');
+    else container.removeAttribute('data-readonly');
+    if (readonly && !model.isReadonly()) {
+      model.setReadonly(true);
+      viewLockedModel = true;
+    } else if (!readonly && viewLockedModel) {
+      model.setReadonly(false);
+      viewLockedModel = false;
+    }
+  };
+  // The instance's own INPUT (setNodes/setEdges/setGroups/loadText) still
+  // applies under that lock, as a system write: it is how every binding feeds a
+  // read-only viewer its data, and a viewer that stopped following its props
+  // would be broken, not read-only.
+  const asInput = <T>(apply: () => T): T => (viewLockedModel ? model.runSystemWrite(apply) : apply());
+  if (options.readonly) applyReadonly(true);
+  const features: Feature[] = [];
+  if (options.connectionReasons) features.push(installConnectReason(featureCtx));
+  const templateCards = nodeTemplates
+    ? installNodeTemplates(featureCtx, nodeTemplates, { templates: options.nodeTemplates!, compactBelow: options.compactBelow, anchorPorts: options.anchorPorts })
+    : null;
+  if (templateCards) features.push(templateCards);
+  if (options.affordances) features.push(installAffordances(featureCtx, options.affordances));
+  /**
+   * `setNodes` writes a node's data by plain assignment — the HOST's state coming
+   * in, which must not become an undo entry. For a templated node that is not
+   * enough on its own: its ports and size come from its data, and its card is
+   * repainted only on a frame that knows the picture changed. So: note each
+   * templated node's data before, and for every one whose data changed re-derive
+   * ports and size (wires on a vanished port go with it, no undo entry) and mark
+   * the frame stale so the card repaints — before a following `setEdges` that
+   * may name a port that has only just appeared.
+   */
+  const templatedData = (): Map<string, string> | null => {
+    if (!nodeTemplates) return null;
+    const out = new Map<string, string>();
+    for (const node of model.getNodes()) if (nodeTemplates.has(node.type)) out.set(node.id, JSON.stringify(node.data ?? {}));
+    return out;
+  };
+  const rederiveTemplates = (before: Map<string, string> | null): void => {
+    if (!nodeTemplates || !before) return;
+    let stale = false;
+    for (const node of model.getNodes()) {
+      if (!nodeTemplates.has(node.type) || before.get(node.id) === JSON.stringify(node.data ?? {})) continue;
+      nodeTemplates.prepare(model, node);
+      stale = true;
+    }
+    if (stale) {
+      renderer.invalidateFrame();
+      scheduler.schedule();
+    }
+  };
+
+  /** Tear a custom host down: the template's bookkeeping, then the host's own hook. */
+  const removeCustomHost = (id: string, host: HTMLElement): void => {
+    templateCards?.unmount(id);
+    options.removeCustomNode?.(id, host);
+  };
+  // The run overlay installs itself on first use: a diagram that never calls
+  // setOverlay() never creates its element or its stylesheet.
+  let runOverlay: RunOverlayFeature | null = null;
+  const overlayFeature = (): RunOverlayFeature => {
+    if (!runOverlay) {
+      runOverlay = installRunOverlay(featureCtx);
+      features.push(runOverlay);
+    }
+    return runOverlay;
+  };
+  const syncFeatures = (): void => {
+    for (const f of features) f.sync?.();
+  };
+  const cameraFeatures = (): void => {
+    for (const f of features) f.camera?.();
+  };
 
   // -- custom (HTML-layer) nodes ---------------------------------------------
   //
@@ -596,6 +1153,13 @@ export function createDiagram(
    */
   const pendingPaints = new Map<string, Promise<void>>();
   const paintFailures = new Map<string, string>();
+  /**
+   * Which of those failures was a SYNCHRONOUS throw rather than a rejected
+   * promise. Kept apart because the two have different fixes and the warning
+   * should say which one happened — "your painter threw" sends a developer to a
+   * stack trace, "your promise rejected" sends them to the async work inside it.
+   */
+  const paintThrew = new Set<string>();
 
   const isThenable = (value: unknown): value is PromiseLike<unknown> =>
     value !== null &&
@@ -662,9 +1226,28 @@ export function createDiagram(
       // 'destroy' cull mode, which is the one mode that re-runs a painter.
       pendingPaints.delete(node.id);
       paintFailures.delete(node.id);
+      paintThrew.delete(node.id);
       // The RETURN VALUE is the whole async contract: a painter that is not finished says
       // so by handing back a promise. Sync painters return undefined and cost nothing.
-      trackPaint(node.id, options.renderCustomNode?.(node, host));
+      //
+      // A painter that THROWS is contained here, exactly like one whose promise
+      // rejects — same failure map, same export warning. Uncontained, a single
+      // bad widget did far more than blank itself: the throw propagated out of
+      // the mount paint, which runs BEFORE `const instance` is constructed, so
+      // createDiagram() never returned. The caller got an exception instead of a
+      // diagram and therefore had no handle to dispose — while the instance was
+      // already alive, with its ResizeObserver still driving the viewport. Retry
+      // the call (which is what a React error boundary or StrictMode does) and
+      // the undisposable instances stack up in the same container.
+      try {
+        trackPaint(
+          node.id,
+          templateCards && nodeTemplates?.has(node.type) ? templateCards.mount(node, host) : options.renderCustomNode?.(node, host)
+        );
+      } catch (error) {
+        paintFailures.set(node.id, error instanceof Error ? error.message : String(error));
+        paintThrew.add(node.id);
+      }
     } else if (!host.parentNode) {
       // Re-entry after a detach cull: the SAME element goes back, with its subtree, its
       // scroll offset, its canvas bitmap and its event listeners intact. `renderCustomNode`
@@ -718,7 +1301,7 @@ export function createDiagram(
         if (!culler.admits(node.id, nodeBounds(node), !!existing?.parentNode)) {
           if (existing) {
             if (culler.getMode() === 'destroy') {
-              options.removeCustomNode?.(node.id, existing);
+              removeCustomHost(node.id, existing);
               existing.remove();
               nodeHosts.delete(node.id);
             } else if (existing.parentNode) {
@@ -739,16 +1322,16 @@ export function createDiagram(
 
     for (const [id, host] of [...nodeHosts]) {
       if (wanted.has(id)) continue;
-      options.removeCustomNode?.(id, host);
+      removeCustomHost(id, host);
       host.remove();
       nodeHosts.delete(id);
     }
   };
 
   /**
-   * The custom nodes an export with this scope will contain — the one definition of
-   * "in scope", shared by everything that has to agree on it (what gets materialized,
-   * what gets pinned, what gets waited for).
+   * Which custom nodes an export can contain — combined with the export's own scope by
+   * the pipeline, it is the one definition of "in scope", shared by everything that has
+   * to agree on it (what gets materialized, what gets pinned, what gets waited for).
    *
    * WHAT IT WILL NOT INCLUDE. An explicit {@link ViewLifecycle} freeze is skipped, and
    * that is not timidity: `SVGRenderer.render` gates every entity on
@@ -756,15 +1339,8 @@ export function createDiagram(
    * Capturing its widget would put content in the file with no node beneath it, and
    * stretch the fitted viewBox to reach a node the same file does not draw.
    */
-  const exportableCustomNodes = (needed: (node: NodeModel) => boolean): NodeModel[] =>
-    model
-      .getNodes()
-      .filter(
-        (node: NodeModel) =>
-          !!node.getMetadata('useHTMLLayer') &&
-          needed(node) &&
-          !lifecycle?.isExplicitlyFrozen('node', node.id)
-      );
+  const isExportableCustomNode = (node: NodeModel): boolean =>
+    !!node.getMetadata('useHTMLLayer') && !lifecycle?.isExplicitlyFrozen('node', node.id);
 
   /**
    * FORCE-MATERIALIZE the hosts an export is about to read, and hand back the undo.
@@ -804,7 +1380,7 @@ export function createDiagram(
    *                       between `setNodes()` and the frame it schedules — which used to
    *                       export blank widgets, and no longer does.)
    *
-   * WHAT IT WILL NOT OVERRULE is decided by `exportableCustomNodes` above — an explicit
+   * WHAT IT WILL NOT OVERRULE is decided by `isExportableCustomNode` above — an explicit
    * {@link ViewLifecycle} freeze is skipped, and it says why.
    *
    * WHAT IT CANNOT DO ON ITS OWN. `renderCustomNode` is called here and read on the next
@@ -813,10 +1389,10 @@ export function createDiagram(
    * below exists for; the synchronous one still reports it rather than exporting a
    * silent blank.
    */
-  const materializeCustomNodes = (needed: (node: NodeModel) => boolean): (() => void) => {
+  const materializeCustomNodes = (nodes: readonly NodeModel[]): (() => void) => {
     const undo: Array<() => void> = [];
 
-    for (const node of exportableCustomNodes(needed)) {
+    for (const node of nodes) {
       if (nodeHosts.get(node.id)?.parentNode) continue; // already live — leave it alone
 
       const was = nodeHosts.has(node.id) ? 'detached' : 'absent';
@@ -844,7 +1420,7 @@ export function createDiagram(
           // firing again would dispose an embedder's component twice. In the synchronous
           // path nothing can run in between, so this is always true and changes nothing.
           if (nodeHosts.get(node.id) !== host) return;
-          options.removeCustomNode?.(node.id, host);
+          removeCustomHost(node.id, host);
           host.remove();
           nodeHosts.delete(node.id);
         });
@@ -873,8 +1449,11 @@ export function createDiagram(
   ): string | undefined => {
     const failure = paintFailures.get(id);
     if (failure !== undefined) {
+      const how = paintThrew.has(id)
+        ? 'THREW synchronously'
+        : 'promise REJECTED';
       return (
-        `custom node "${id}" — its renderCustomNode promise REJECTED (${failure}), so whatever ` +
+        `custom node "${id}" — its renderCustomNode ${how} (${failure}), so whatever ` +
         'it had not drawn by then is missing from this export.'
       );
     }
@@ -894,304 +1473,30 @@ export function createDiagram(
   };
 
   /**
-   * THE EXPORT BOUNDARY for HTML-layer nodes.
+   * THE EXPORT BOUNDARY for HTML-layer nodes — this canvas's hosts, handed to the shared
+   * pipeline in `export/capture-pipeline.ts` (which every canvas runs, so the Angular
+   * canvas captures its own HTML layer through the identical code).
    *
-   * A custom node paints into a raw host that is a SIBLING of the SVG, so the VNode
-   * tree the exporter serializes contains an empty `<g>` for it and nothing else. That
-   * is why an exported dashboard used to be a set of blank rectangles: the content was
-   * never in the tree to begin with.
-   *
-   * THIS is the only place that can fix it, because this is the only place that holds
-   * the hosts. So the DOM read happens HERE, once, and produces plain data —
-   * `exportSvg` stays pure, DOM-free and deterministic, which is a property worth
-   * strictly more than the convenience of reaching into the document from inside it.
-   *
-   * A caller's own `customNodes` always wins (including `[]`, which means "export the
-   * diagram without its widgets").
+   * Only this instance holds the hosts, the culler and the paint ledger, so what it
+   * supplies is exactly those: where each host is, how to force-mount one
+   * (`materializeCustomNodes`), which painters are still pending, what to warn about
+   * them, and the pin that keeps a waited-on host from being culled mid-capture.
    */
-  const captureCustomNodes = (needed: (node: NodeModel) => boolean): CustomNodeCapture[] => {
-    const restore = materializeCustomNodes(needed);
-    try {
-      return readHosts(false, 0);
-    } finally {
-      // `finally`: a capture that threw must not leave a board's worth of hosts mounted.
-      // (`captureCustomNodeHost` is documented never to throw, but the restore is the one
-      // thing here whose failure would be permanent, so it does not depend on that.)
-      restore();
-    }
-  };
-
-  /** The DOM read, shared by both capture paths so they cannot disagree about a host. */
-  const readHosts = (waited: boolean, timeoutMs: number): CustomNodeCapture[] => {
-    const captures: CustomNodeCapture[] = [];
-    // Model order, not Map order: an export must not depend on mount sequence, or two
-    // runs of the same board would differ in byte order.
-    for (const node of model.getNodes()) {
-      const host = nodeHosts.get(node.id);
-      if (!host) continue;
-      const capture = captureCustomNodeHost(node.id, nodeBounds(node), host);
-      // A still-painting caveat is the CAUSE and leads; the capture's own fidelity caveats
-      // (an image that PDF cannot draw, an inset shadow that was skipped) follow it. Merging
-      // rather than overwriting keeps both — a widget can be both async AND hold an image.
-      const paint = paintWarning(node.id, waited, timeoutMs);
-      const warning = [paint, capture.warning].filter(Boolean).join(' ');
-      captures.push(warning ? { ...capture, warning } : capture);
-    }
-    return captures;
-  };
-
-  /**
-   * THE ASYNC CAPTURE — the same boundary, allowed to wait for a painter that said it
-   * was not finished.
-   *
-   * THE SIGNAL IS THE PROMISE, and nothing else. A fixed sleep would be both slow (every
-   * export pays for the slowest imaginable widget) and wrong (the slowest widget is always
-   * slower than the guess, on someone's machine). `renderCustomNode` returning a promise
-   * is a contract the painter's author owns, can type, and is never wrong about — so this
-   * waits for exactly those, and returns the instant the last one settles.
-   *
-   * THE BOUND. `customNodeTimeout` (default 5s) is a safety net, never the mechanism: a
-   * painter that never settles must not hang a print job. On expiry the export takes the
-   * host as it stands — partial, or blank — and every widget it did not get to wait out is
-   * WARNED about by id. Degraded, reported, never silent.
-   *
-   * WHY THE SYNC PATH IS REUSED VERBATIM WHEN NOTHING IS PENDING. If no painter in scope
-   * has an unsettled promise, this runs materialize → read → restore with no suspension
-   * point at all, i.e. the identical sequence `exportSvgString()` performs. That makes "an
-   * all-sync board exports the same bytes through both paths" structurally true rather
-   * than merely tested — there is no second code path for it to drift into.
-   */
-  const captureCustomNodesAsync = async (
-    needed: (node: NodeModel) => boolean,
-    timeoutMs: number
-  ): Promise<CustomNodeCapture[]> => {
-    const scope = exportableCustomNodes(needed).map((node: NodeModel) => node.id);
-    for (const id of scope) pinnedHosts.add(id);
-
-    const restore = materializeCustomNodes(needed);
-    try {
-      // Only NOW is the pending set knowable: materializing runs first mounts, and a
-      // first mount is exactly where a painter announces that it is async.
-      const waits = scope
-        .map((id) => pendingPaints.get(id))
-        .filter((p): p is Promise<void> => p !== undefined);
-
-      if (waits.length === 0) return readHosts(false, timeoutMs); // ← atomic, as above
-      await settle(waits, timeoutMs);
-      return readHosts(true, timeoutMs);
-    } finally {
-      restore();
-      for (const id of scope) pinnedHosts.delete(id);
-    }
-  };
-
-  /** Wait for every tracked paint, or for the deadline — whichever comes first. */
-  const settle = async (waits: Promise<void>[], timeoutMs: number): Promise<void> => {
-    if (!(timeoutMs > 0)) return; // 0 (or nonsense) means "do not wait"; still reported
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const deadline = new Promise<void>((resolve) => {
-      timer = setTimeout(resolve, timeoutMs);
-    });
-    try {
-      // The tracked promises are wrapped never to reject, so this races two resolutions
-      // and cannot itself throw. A rejecting painter is recorded, not propagated.
-      await Promise.race([Promise.all(waits), deadline]);
-    } finally {
-      // Without this a fast export still holds the event loop open for the full deadline,
-      // which in Node keeps a process alive after the work is done.
-      if (timer !== undefined) clearTimeout(timer);
-    }
-  };
-
-  /**
-   * ONE async capture at a time.
-   *
-   * Two exports in flight would otherwise interleave their materialize/restore pairs —
-   * the first's restore tearing down a host the second is still waiting to read, which is
-   * a blank widget in a file that asked for nothing unusual. Serializing is also the
-   * cheaper answer: the second export finds the first's painters already settled.
-   */
-  let captureQueue: Promise<unknown> = Promise.resolve();
-  const serializeCapture = <T>(run: () => Promise<T>): Promise<T> => {
-    const result = captureQueue.then(run, run);
-    captureQueue = result.then(
-      () => undefined,
-      () => undefined
-    );
-    return result;
-  };
-
-  /**
-   * Which nodes this export will actually contain.
-   *
-   * Materializing is the expensive half — it runs a painter — so it is bounded by the
-   * export's own scope rather than mounting a 300-widget board to capture the three
-   * widgets `includeIds` asked for. The predicates mirror what the renderer resolves
-   * `ids` to (`SVGRenderer.selectedIds` reads exactly this `state.selected`), so what is
-   * mounted and what survives `filterCaptures` are the same set.
-   */
-  const exportNeeds = (exportOptions?: ExportOptions): ((node: NodeModel) => boolean) => {
-    if (exportOptions?.scope === 'selection') return (node) => node.state?.selected === true;
-    if (exportOptions?.includeIds === undefined) return () => true;
-    const ids = new Set(exportOptions.includeIds);
-    return (node) => ids.has(node.id);
-  };
-
-  const withCustomNodes = (exportOptions?: ExportOptions): ExportOptions => {
-    if (exportOptions?.customNodes !== undefined) return exportOptions;
-    const customNodes = captureCustomNodes(exportNeeds(exportOptions));
-    if (customNodes.length === 0) return exportOptions ?? {};
-    return { ...exportOptions, customNodes };
-  };
-
-  /** Default bound on waiting for an async painter. See ExportOptions.customNodeTimeout. */
-  const DEFAULT_CUSTOM_NODE_TIMEOUT = 5000;
-
-  const withCustomNodesAsync = async (exportOptions?: ExportOptions): Promise<ExportOptions> => {
-    // The caller's own captures win, and short-circuit the wait entirely — `customNodes:
-    // []` means "export the diagram without its widgets", which must not sit out a
-    // deadline for painters whose output was never going in the file.
-    if (exportOptions?.customNodes !== undefined) return exportOptions;
-    const customNodes = await serializeCapture(() =>
-      captureCustomNodesAsync(
-        exportNeeds(exportOptions),
-        exportOptions?.customNodeTimeout ?? DEFAULT_CUSTOM_NODE_TIMEOUT
-      )
-    );
-    if (customNodes.length === 0) return exportOptions ?? {};
-    return { ...exportOptions, customNodes };
-  };
-
-  /**
-   * EXTERNAL-URL IMAGES → embedded bytes, for the async export only.
-   *
-   * A widget's `<img src="https://…">` captures as `<image href="https://…">`, which an
-   * SVG renders online and a PDF cannot draw at all. This library is client-side: the
-   * export RUNS IN A BROWSER, and the browser can usually fetch that URL itself. So the
-   * awaited path fetches every external reference and swaps it for the `data:` URI the
-   * PDF writer already embeds as an XObject (b2854b0a1) — three tiers, see
-   * `fetchAssetsTiered`: environment fetch (same-origin / CORS-allowed), then
-   * `ExportOptions.assetFetcher` (the app's proxy), then the accurate warning.
-   *
-   * TWO KINDS OF IMAGE, ONE PASS. Widget captures hold their images as captured VNodes
-   * and are substituted here directly. But a PANEL-type diagram node (an ERD avatar, a
-   * logo — `metadata.panel.image/icon.href`) is painted by the RENDERER'S OWN tree,
-   * which is built inside the synchronous export — this layer never holds it. So the
-   * renderer enumerates that tree's URLs up front (`collectExportImageUrls` — the same
-   * `render()` the export serializes, so no drift), the fetch covers the UNION of both
-   * kinds (one fetch per URL, however many widgets and panels share it), and the
-   * resolved map rides down `ExportOptions.resolvedAssets` for the sync path's pure
-   * `inlineAssets` substitution. A URL the caller pre-resolved is trusted, never fetched.
-   *
-   * THE WARNING LEDGER IS RECONCILED, both ways. A capture whose external images were
-   * all embedded has its capture-time "EXTERNAL URL" caveat STRIPPED — after the fetch
-   * it asserts a problem that no longer exists. A URL every tier failed on keeps the
-   * reference (broken-but-visible beats silently blanked, the `inlineAssets` rule) and
-   * gains a warning naming the URL, the reason, and the escape hatches — a tree image's
-   * failure reaches `onWarnings` the same way a widget image's reaches the capture.
-   *
-   * `exportSvgString()` / `exportPdf()` stay synchronous and network-free: they fetch
-   * nothing, and honour only a `resolvedAssets` map the caller supplies.
-   */
-  const withInlinedImages = async (exportOptions: ExportOptions): Promise<ExportOptions> => {
-    const captures = exportOptions.customNodes ?? [];
-
-    // Collect the union — widget-capture URLs first, then the renderer's tree — each
-    // deduplicated in a STABLE order (model order, then first appearance) for
-    // determinism. One URL, one fetch, no matter which kinds reference it.
-    const roots = new Map<CustomNodeCapture, VNode>();
-    const urls: string[] = [];
-    const seen = new Set<string>();
-    const add = (found: readonly string[]): void => {
-      for (const url of found) {
-        if (!seen.has(url)) {
-          seen.add(url);
-          urls.push(url);
-        }
-      }
-    };
-    for (const capture of captures) {
-      if (!capture.content || capture.content.length === 0) continue;
-      const root: VNode = { type: 'g', props: {}, children: [...capture.content] };
-      const found = collectAssetUrls(root);
-      if (found.length === 0) continue;
-      roots.set(capture, root);
-      add(found);
-    }
-    const treeUrls = renderer.collectExportImageUrls(exportOptions);
-    add(treeUrls);
-
-    if (urls.length === 0) return exportOptions; // nothing external — identical options out
-
-    // A URL the caller already resolved is bytes we hold — fetching it again would be
-    // both wasteful and a trust inversion (their bytes are the ones they want in the file).
-    const preResolved = exportOptions.resolvedAssets;
-    const toFetch = preResolved ? urls.filter((url) => !preResolved.has(url)) : urls;
-
-    const { byUrl, failures } =
-      toFetch.length > 0
-        ? await fetchAssetsTiered(toFetch, {
-            fetcher: exportOptions.assetFetcher,
-            maxBytes: exportOptions.assetMaxBytes,
-            timeoutMs: exportOptions.assetTimeout,
-          })
-        : { byUrl: new Map<string, string>(), failures: new Map<string, string>() };
-    if (preResolved) {
-      for (const [url, uri] of preResolved) byUrl.set(url, uri);
-    }
-
-    const customNodes = captures.map((capture): CustomNodeCapture => {
-      const root = roots.get(capture);
-      if (!root) return capture;
-
-      const inlined = inlineAssets(root, byUrl);
-      const remaining = collectAssetUrls(inlined);
-
-      let warning = capture.warning;
-      if (remaining.length === 0) {
-        // Every external image is now bytes in the file — the capture-time caveat
-        // (written for the sync paths, which cannot fetch) is no longer true here.
-        warning = stripResolvedImageWarnings(warning);
-      } else {
-        const residue = remaining
-          .map(
-            (url) =>
-              `widget image "${url}" could not be embedded: ${failures.get(url) ?? 'unknown failure'}. ` +
-              'The reference is left in the file (an SVG still renders it online); it will be ' +
-              'MISSING from a PDF export.'
-          )
-          .join(' ');
-        warning = [warning, residue].filter(Boolean).join(' ');
-      }
-
-      return { ...capture, content: inlined.children ?? [], warning };
-    });
-
-    const out: ExportOptions = { ...exportOptions };
-    if (exportOptions.customNodes !== undefined) out.customNodes = customNodes;
-    // The resolved map rides DOWN the same options object: the sync export applies it
-    // to the renderer's tree with the pure `inlineAssets` — which is how a panel image
-    // becomes bytes without the sync path ever fetching.
-    if (byUrl.size > 0) out.resolvedAssets = byUrl;
-
-    // A TREE image's failure has no capture to carry its warning, so it goes to the
-    // export's own fidelity channel. Same honesty rule as the widget residue: name the
-    // URL, the reason, and (via the tier-3 text) both escape hatches.
-    const treeResidue = treeUrls
-      .filter((url) => !byUrl.has(url))
-      .map(
-        (url) =>
-          `diagram image "${url}" could not be embedded: ${failures.get(url) ?? 'unknown failure'}. ` +
-          'The reference is left in the file (an SVG still renders it online); it will be ' +
-          'MISSING from a PDF export.'
-      );
-    if (treeResidue.length > 0) {
-      const original = exportOptions.onWarnings;
-      out.onWarnings = (warnings) => original?.([...warnings, ...treeResidue]);
-    }
-
-    return out;
-  };
+  const exportPipeline = createExportPipeline(renderer, {
+    getNodes: () => model.getNodes(),
+    getHost: (id) => nodeHosts.get(id),
+    isExportable: isExportableCustomNode,
+    bounds: nodeBounds,
+    materialize: materializeCustomNodes,
+    pendingPaint: (id) => pendingPaints.get(id),
+    paintWarning,
+    pin: (ids) => {
+      for (const id of ids) pinnedHosts.add(id);
+      return () => {
+        for (const id of ids) pinnedHosts.delete(id);
+      };
+    },
+  });
 
   // -- the frame --------------------------------------------------------------
   let lastViewportKey = '';
@@ -1200,6 +1505,19 @@ export function createDiagram(
   let lastFrameEpoch = -1;
   /** Renderer invalidation epoch as of the end of the last painted frame. */
   let lastRendererEpoch = -1;
+  /**
+   * Coverage of the frame currently in the DOM — OUR copy, captured right after
+   * the render() call paint() reconciled. Never read the renderer's field
+   * lazily: exports share the render pass and overwrite it (see
+   * SVGRenderer.getFrameCoverage).
+   */
+  let lastFrameCoverage: FrameCoverage | null = null;
+  /**
+   * True while renderNow() is on the stack. renderNow is the documented "give
+   * me a correct DOM before I measure it" escape hatch — it must reconcile for
+   * real, never take the camera fast path.
+   */
+  let forceFullPaint = false;
   let ready = false;
   let disposed = false;
 
@@ -1256,6 +1574,10 @@ export function createDiagram(
    */
   const canSkipFrame = (): boolean => {
     if (!engine.getDiagram()) return false;
+    // A feature measured something DURING the last frame (a port anchored to its
+    // row) and owes the picture a repaint. Its change happened before that frame
+    // stamped its epochs, so the epochs alone would call this frame idle.
+    if (featureRepaintOwed) return false;
     if (getMutationEpoch() !== lastFrameEpoch) return false;
     // …and the RENDERER's own picture must not have gone stale either. The model
     // epoch answers "did the world change"; this answers "did my picture of it
@@ -1284,7 +1606,74 @@ export function createDiagram(
    * structurally impossible rather than merely absent today. (`node-component.ts`
    * had exactly this bug in its refresh loop; it now batches the same way.)
    */
+  /**
+   * THE CAMERA FAST PATH. The SVG draws in WORLD coordinates — the camera is
+   * nothing but the root's `viewBox` attribute plus the HTML layer's CSS
+   * transform. So a frame in which ONLY the camera moved needs no VNode build,
+   * no reconcile, no custom-node sync: rewrite those two strings and the
+   * already-painted overscan margin (SVGRenderer.CAMERA_OVERSCAN) scrolls into
+   * view. This is what holds 60fps pan on scenes whose full frame costs 30ms.
+   *
+   * "Only the camera moved" is decided by the SAME signals canSkipFrame()
+   * already stakes correctness on — the model's mutation epoch and the
+   * renderer's invalidation epoch. Anything that changes the picture without
+   * bumping one of those is already a bug today (canSkipFrame would drop its
+   * frame outright). On any doubt this returns false and the full paint runs:
+   * the fallback is never wrong, only slower.
+   */
+  const tryCameraFrame = (): boolean => {
+    const cov = lastFrameCoverage;
+    if (!cov || forceFullPaint) return false;
+    // A custom-node culler admits hosts against the exact viewBox inside
+    // syncCustomNodes(), which this path skips — its hosts have no overscan
+    // margin to reveal, so boards that cull custom nodes take the full paint.
+    if (culler) return false;
+    if (!engine.getDiagram()) return false;
+    if (getMutationEpoch() !== lastFrameEpoch) return false;
+    if (renderer.getInvalidationEpoch() !== lastRendererEpoch) return false;
+    if (isConnectionPreviewActive() || lastFrameHadPreview) return false;
+
+    // The zoom must MATCH (LOD tiers are chosen per zoom) and the viewBox must
+    // stay inside what the last full frame actually drew.
+    const zoom = viewport.getZoom();
+    if (zoom !== cov.zoom) return false;
+    const box = viewport.getViewBox();
+    if (box.width !== cov.viewBoxWidth || box.height !== cov.viewBoxHeight) return false;
+    if (!cov.total) {
+      const r = cov.rect;
+      if (
+        box.x < r.x ||
+        box.y < r.y ||
+        box.x + box.width > r.x + r.width ||
+        box.y + box.height > r.y + r.height
+      ) {
+        return false;
+      }
+    }
+
+    const svg = layers.svg.firstElementChild;
+    if (!svg) return false;
+
+    // Identical strings to the ones a full frame would produce: the viewBox from
+    // the same getViewBox() math SVGRenderer uses, the transform from the same
+    // helper paint() writes.
+    svg.setAttribute('viewBox', `${box.x} ${box.y} ${box.width} ${box.height}`);
+    layers.html.setAttribute('style', htmlLayerStyle(viewport.getHtmlLayerTransform()));
+    cameraFeatures();
+
+    // The epochs did not move (precondition) and the DOM'd frame is unchanged —
+    // only the viewport key advances, so a following no-camera schedule skips.
+    lastViewportKey = viewportKey();
+    return true;
+  };
+
   const paint = (): void => {
+    // An owed feature repaint is a FULL frame: the camera-only fast path keys on
+    // the same epochs and would move the viewBox and nothing else.
+    const owed = featureRepaintOwed;
+    featureRepaintOwed = false;
+    if (!owed && tryCameraFrame()) return;
+
     // -- READ ------------------------------------------------------------------
     const renderViewport = viewport.getRenderViewport();
     const zoom = viewport.getZoom();
@@ -1292,11 +1681,15 @@ export function createDiagram(
 
     // -- COMPUTE ---------------------------------------------------------------
     const vnode = renderer.render(renderViewport, zoom);
+    lastFrameCoverage = renderer.getFrameCoverage();
 
     // -- WRITE -----------------------------------------------------------------
     layers.html.setAttribute('style', htmlLayerStyle(htmlTransform));
     patcher.reconcile(layers.svg, vnode);
     syncCustomNodes();
+    syncLineOverlay();
+    syncHighlighterOverlay();
+    syncFeatures();
 
     lastViewportKey = viewportKey();
     lastFrameHadPreview = isConnectionPreviewActive();
@@ -1315,6 +1708,7 @@ export function createDiagram(
    */
   const hydratePaint = (): void => {
     const vnode = renderer.render(viewport.getRenderViewport(), viewport.getZoom());
+    lastFrameCoverage = renderer.getFrameCoverage();
     patcher.hydrate(layers.svg, vnode);
     syncCustomNodes();
     lastViewportKey = viewportKey();
@@ -1356,12 +1750,40 @@ export function createDiagram(
   onModel('group:added', () => scheduler.schedule());
   onModel('group:removed', () => scheduler.schedule());
   onModel('group:changed', () => scheduler.schedule());
+  // Ink paints too. The draw tool asks for its own repaint, so the pen always
+  // looked fine — but ink added IN CODE (a saved board, seeded strokes, a
+  // collaborator's stroke through applyIncremental) stayed invisible until an
+  // unrelated event happened to render.
+  onModel('stroke:added', () => scheduler.schedule());
+  onModel('stroke:removed', () => scheduler.schedule());
+  onModel('strokes:cleared', () => scheduler.schedule());
+  // …and so do the bulk clears, which emit only their `*:cleared` event.
+  onModel('nodes:cleared', () => {
+    scheduler.schedule();
+    emit('nodes:change', { nodes: model.getNodes() });
+  });
+  onModel('links:cleared', () => {
+    scheduler.schedule();
+    emit('edges:change', { edges: model.getLinks() });
+  });
+  onModel('groups:cleared', () => scheduler.schedule());
+  // Comment pins paint too. The overlay drops the cached frame on every store
+  // change, but dropping the cache paints nothing: a new thread showed no pin
+  // (and a resolved one kept its pin) until an unrelated hover repainted.
+  if (commentStore) unsubs.push(commentStore.onChange(() => scheduler.schedule()));
+  // The outline layer's validation is refreshed when the STRUCTURE changes — a
+  // node, link or group added, removed or cleared — as Angular's canvas does
+  // after a structural command. Never per frame: validateDiagram() walks it all.
+  for (const ev of ['node:added', 'node:removed', 'link:added', 'link:removed', 'group:added', 'group:removed', 'nodes:cleared', 'links:cleared', 'groups:cleared']) {
+    onModel(ev, () => {
+      if (!highlighterOn) return;
+      highlighter.refreshValidation(engine);
+      scheduler.schedule();
+    });
+  }
   onModel('selection:changed', () => {
     scheduler.schedule();
-    emit('selection:change', {
-      nodes: model.getSelectedNodes(),
-      edges: model.getLinks().filter((l: LinkModel) => l.state === 'selected'),
-    });
+    announceSelection();
   });
 
   unsubs.push(
@@ -1370,13 +1792,37 @@ export function createDiagram(
       emit('viewport:change', state);
     })
   );
+  // An interaction-config change (port visibility, handles, …) is painted on the
+  // next frame. The renderer drops its cache and invalidates the frame on this
+  // event, but nothing asked for a frame: `setInteractionConfig()` after the canvas
+  // had settled showed nothing until an unrelated repaint. Angular's canvas does this.
+  unsubs.push(engine.eventBus.on('config:interaction-changed', () => scheduler.schedule()));
 
   // -- resize -----------------------------------------------------------------
+  /** An adopted server root and SVG layer go back to the live styles (fill the container). */
+  const releaseServerLayer = (): void => {
+    if (layers.svg.getAttribute('style') !== SVG_LAYER_STYLE) layers.svg.setAttribute('style', SVG_LAYER_STYLE);
+    if (layers.root.getAttribute('style') !== ROOT_STYLE) layers.root.setAttribute('style', ROOT_STYLE);
+  };
   let resizeObserver: ResizeObserver | undefined;
   if (typeof ResizeObserver !== 'undefined') {
+    // An adopted server svg is drawn into the real container with the default
+    // preserveAspectRatio (xMidYMid meet) until the first resize: a fitted picture
+    // sits in the MIDDLE of a wider box. The first size sync keeps that centre, or
+    // the picture jumped right on resume and its left edge was clipped.
+    let keepCentre = !!hydration;
     resizeObserver = new ResizeObserver(() => {
       const r = getRect();
-      if (r.width > 0 && r.height > 0) viewport.syncCanvasSize(r);
+      if (!(r.width > 0 && r.height > 0)) return;
+      viewport.syncCanvasSize(r, keepCentre ? { anchor: 'center' } : {});
+      if (keepCentre) {
+        // The server layer held its canvas at 1:1, centred (serverSvgLayerStyle).
+        // Let it fill the container and paint the synced camera in THIS callback
+        // (before the browser paints): same scale, same centre, no frame between.
+        releaseServerLayer();
+        scheduler.flush();
+      }
+      keepCentre = false;
     });
     resizeObserver.observe(container);
   }
@@ -1386,6 +1832,8 @@ export function createDiagram(
 
   if (hydration) {
     hydratePaint();
+    // No observer will ever report a size: release the server layer now.
+    if (!resizeObserver) releaseServerLayer();
   } else {
     if (options.fitView) fitView(40);
     // Synchronous first paint: a host that measures right after createDiagram()
@@ -1394,7 +1842,7 @@ export function createDiagram(
   }
 
   function fitView(padding = 40): void {
-    const bounds = contentBounds(model);
+    const bounds = contentBounds(model, renderer.getTheme());
     // maxZoom 1: fitting means "show me everything", never "magnify a small
     // graph until it fills the wall". Zooming out to fit is still unbounded
     // (down to the controller's minZoom). Hosts wanting magnification can call
@@ -1404,10 +1852,19 @@ export function createDiagram(
 
   const instance: DiagramInstance = {
     setNodes(nodes) {
-      if (applyNodes(model, nodes)) scheduler.schedule();
+      const before = templatedData();
+      const changed = asInput(() => applyNodes(model, nodes));
+      asInput(() => rederiveTemplates(before));
+      if (changed) scheduler.schedule();
     },
     setEdges(edges) {
-      if (applyEdges(model, edges)) scheduler.schedule();
+      if (asInput(() => applyEdges(model, edges, (w) => warnEdge(w)))) scheduler.schedule();
+    },
+    setGroups(groups) {
+      if (asInput(() => applyGroups(model, groups))) {
+        renderer.invalidateFrame();
+        scheduler.schedule();
+      }
     },
     getModel: () => model,
     getEngine: () => engine,
@@ -1448,27 +1905,51 @@ export function createDiagram(
       renderer.setTokenBridge(bridge);
       scheduler.schedule();
     },
+    setHighlightConnected(value) {
+      renderer.setHighlightConnected(value);
+      scheduler.schedule();
+    },
+    setHighlighterConfig(value) {
+      applyHighlighterConfig(value);
+      // nothing in the model changed, so the frame gate must be told
+      renderer.invalidateFrame();
+      scheduler.schedule();
+    },
+    getHighlightConnected: () => renderer.getHighlightConnected(),
 
     // THE ONLY ASYNC EXPORT ENTRY POINT — and it always was one. `IRenderer.export`
     // has returned a Promise since the seam existed, so an ASYNC custom-node painter
     // needs no new public method: this is where waiting for one belongs. The two
     // synchronous entry points below keep their contract exactly, and report an
     // unfinished painter rather than pretending to have read it.
-    export: async (format, exportOptions) =>
-      renderer.export(format, await withInlinedImages(await withCustomNodesAsync(exportOptions))),
-    exportSvgString: (exportOptions) => renderer.exportSvgString(withCustomNodes(exportOptions)),
-    exportPdf: (exportOptions) => renderer.exportPdf(withCustomNodes(exportOptions)),
+    export: (format, exportOptions) => exportPipeline.export(format, exportOptions),
+    exportSvgString: (exportOptions) => exportPipeline.exportSvgString(exportOptions),
+    exportPdf: (exportOptions) => exportPipeline.exportPdf(exportOptions),
 
     exportText: (textOptions) => exportDiagramText(model, textOptions),
-    loadText: (text, textOptions) => {
-      const result = importDiagramText(text, textOptions);
-      // Reconcile INTO the live model (never swap it): applyNodes/applyEdges
-      // are full reconcilers, so removals happen and every listener, plugin,
-      // and renderer binding stays attached to the same DiagramModel.
-      applyNodes(model, result.diagram.getNodes().map((n) => toNodeSpec(n)));
-      applyEdges(model, result.diagram.getLinks().map((l) => toEdgeSpec(l)));
+    loadText: (text, textOptions) => asInput(() => {
+      // The shared load path (refuse unreadable text, the C9 notation kits,
+      // reconcile the imported models, groups and ink, adopt the diagram type) —
+      // the framework canvases call the same function.
+      // A Mermaid import measures its words in THIS canvas's face (svg/text-measure.ts).
+      const face = renderer.getTheme().typography?.fontFamily?.default as string | undefined;
+      const result = loadTextInto(model, text, { measureText: canvasTextMeasure(face), ...textOptions }, {
+        beforeNodes: templatedData,
+        afterNodes: (before) => rederiveTemplates(before as Map<string, string> | null),
+        warnEdge: (w) => warnEdge(w),
+        adoptComments: commentStore ? (tree, o) => commentStore?.adopt(tree, o) : undefined,
+      });
+      const kit = textKitFor(result.diagram.getMetadata('diagramType'));
+      scheduler.schedule();
+      if (kit?.finalize) {
+        try {
+          kit.finalize(instance);
+        } catch {
+          /* a kit's finalize must never break the load */
+        }
+      }
       return result;
-    },
+    }),
 
     /** The LOD tier actually rendered, and the governor's last verdict. */
     getQualityState: () => renderer.getQualityState(),
@@ -1477,9 +1958,17 @@ export function createDiagram(
     animations: renderer.getAnimationService(),
 
     fitView,
+    getContentBounds: () => contentBounds(model, renderer.getTheme()),
 
     render: () => scheduler.schedule(),
-    renderNow: () => scheduler.flush(),
+    renderNow: () => {
+      forceFullPaint = true;
+      try {
+        scheduler.flush();
+      } finally {
+        forceFullPaint = false;
+      }
+    },
 
     batchUpdate(mutate) {
       model.beginBatch();
@@ -1499,6 +1988,26 @@ export function createDiagram(
     },
 
     getDraggingNodeIds: () => binder.getDraggingNodeIds(),
+    setReadonly(readonly: boolean) {
+      applyReadonly(readonly);
+      scheduler.schedule();
+    },
+    isReadonly: () => binder.readonlyNow(),
+    copy: () => clipboardApi.copy(),
+    cut: () => clipboardApi.cut(),
+    paste: (data, pasteOptions) => clipboardApi.paste(data, pasteOptions),
+    setOverlay: (overlay) => overlayFeature().set(overlay),
+    clearOverlay: () => runOverlay?.set({}),
+    getOverlay: () => runOverlay?.get() ?? {},
+    tidy: (tidyOptions = {}) => tidyFlow(engine, tidyOptions, () => scheduler.schedule()),
+    placeNodes: (ids, placeOptions = {}) => placeFlow(engine, ids, placeOptions, () => scheduler.schedule()),
+    async insertNodeOnLink(linkId, node, insertOptions) {
+      const result = await insertNodeOnLink(engine, linkId, node, insertOptions, nodeTemplates ? (n) => nodeTemplates.prepare(model, n) : undefined);
+      if (result) scheduler.schedule();
+      return result;
+    },
+
+    beginLabelEdit: (target, opts) => binder.beginLabelEdit(target, opts),
 
     registry: renderer.getRegistry(),
 
@@ -1508,6 +2017,9 @@ export function createDiagram(
 
       commentOverlay?.dispose();
       commentOverlay = null;
+      for (const f of features.splice(0)) f.dispose();
+      stopTemplates?.();
+      if (nodeTemplates && model.getNodeTemplateResolver() === nodeTemplates.resolve) model.setNodeTemplateResolver(null);
       binder.detach();
       scheduler.dispose();
       resizeObserver?.disconnect();
@@ -1517,7 +2029,7 @@ export function createDiagram(
       listeners.clear();
 
       for (const [id, host] of [...nodeHosts]) {
-        options.removeCustomNode?.(id, host);
+        removeCustomHost(id, host);
         host.remove();
       }
       nodeHosts.clear();
@@ -1541,39 +2053,9 @@ export function createDiagram(
 }
 
 
-/** World bounding box of every visible node, or null when there is nothing to fit. */
-export function contentBounds(model: DiagramModel): Rectangle | null {
-  const nodes = model.getNodes().filter((n: NodeModel) => n.state?.visible !== false);
-  if (nodes.length === 0) return null;
-
-  let left = Infinity;
-  let top = Infinity;
-  let right = -Infinity;
-  let bottom = -Infinity;
-
-  for (const node of nodes) {
-    left = Math.min(left, node.position.x);
-    top = Math.min(top, node.position.y);
-    right = Math.max(right, node.position.x + (node.size?.width ?? 0));
-    bottom = Math.max(bottom, node.position.y + (node.size?.height ?? 0));
-  }
-
-  // Routed edges arc OUTSIDE the node bbox (a detour around an obstacle, a
-  // self-loop, a floating attachment's curve). Fitting to nodes alone left
-  // those arcs sliced off at the viewport edge — nodes "contained", picture
-  // clipped. Union in every routed waypoint the links carry.
-  for (const link of model.getLinks()) {
-    for (const p of link.points ?? []) {
-      left = Math.min(left, p.x);
-      top = Math.min(top, p.y);
-      right = Math.max(right, p.x);
-      bottom = Math.max(bottom, p.y);
-    }
-  }
-
-  if (!isFinite(left) || !isFinite(top)) return null;
-  return { x: left, y: top, width: right - left, height: bottom - top };
-}
+// contentBounds lives in its own DOM-free module so the server render fits the
+// same way; re-exported here, where callers have always found it.
+export { contentBounds };
 
 interface Layers {
   root: HTMLElement;
@@ -1618,3 +2100,4 @@ function ensureLayers(
 
   return { root, svg, html };
 }
+

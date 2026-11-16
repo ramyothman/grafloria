@@ -45,7 +45,7 @@ export * from './engine';
 
 // Serialization
 export { DiagramSerializer } from './serialization/Serializer';
-export type { SerializedDiagram as SerializedDiagramData } from './serialization/Serializer';
+export type { SerializedDiagramData } from './serialization/Serializer';
 export {
   DIAGRAM_SCHEMA_VERSION,
   registerDiagramMigration,
@@ -105,6 +105,11 @@ export type {
   DiagramValidationFinding,
   DiagramValidationReport,
 } from './serialization/DiagramValidator';
+
+// Interop — .drawio (mxGraph XML) import: the migration on-ramp from draw.io
+// files. v1 is import-only; every dropped construct surfaces as a named warning.
+export { importDrawio, stripHtmlToText } from './interop/drawio';
+export type { DrawioImportResult } from './interop/drawio';
 
 // Performance
 export * from './performance';
@@ -209,3 +214,8 @@ export * from './comments';
 // (catch-up, causal readiness, batching, mesh relay), three real transports, and the
 // awareness channel — which is separate from the op log, and must stay that way.
 export * from './sync';
+
+// Diagnostic logging — OFF by default. The library used to narrate into every
+// consumer's console (~690 ungated console.log calls, emoji and all); the
+// messages now go through this switch instead.
+export { setDebugLogging, isDebugLogging, debugLog } from './util/debug';

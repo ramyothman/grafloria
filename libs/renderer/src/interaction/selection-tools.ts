@@ -29,7 +29,7 @@ import {
 } from '../svg/node-toolbar';
 
 /**
- * SelectionToolsController — the floating tool layer (Card 5, wave4/interaction).
+ * SelectionToolsController — the floating tool layer.
  *
  * Everything a user can grab AROUND a selection lives here: the 8 resize
  * handles, the rotate handle, the remove button, the Halo context toolbar
@@ -89,9 +89,9 @@ export interface ToolHandle {
   /**
    * resize-ux: for the four SIDE resize handles (n/e/s/w), the full edge they
    * own, as a WORLD segment (rotated with the node). React Flow's side
-   * affordance is the whole border line, not a midpoint dot — the live audit
-   * found the 6px dots unreachable (fully inside the port's hover halo), so a
-   * side handle hit-tests as a BAND around this segment: grab the border
+   * affordance is the whole border line, not a midpoint dot (a 6px dot would sit
+   * inside the port's hover halo), so a side handle hit-tests as a BAND around
+   * this segment: grab the border
    * anywhere and that edge follows. `world` stays the midpoint for hosts that
    * draw dots. Corner handles never carry a segment.
    */
@@ -151,7 +151,7 @@ export interface SelectionToolsConfig {
   /** Rotation snap while a modifier is held, in degrees. */
   rotationSnapDegrees: number;
   /**
-   * Per-TYPE toolbar policy (Card 6). Layered on top of each node's own
+   * Per-TYPE toolbar policy. Layered on top of each node's own
    * `metadata.toolbar`; lets a host decide which tools a node type exposes
    * without touching per-node data. Omit for "every tool, every node".
    */
@@ -240,6 +240,34 @@ function distToSegmentSq(px: number, py: number, a: Point, b: Point): number {
   const cx = a.x + t * abx;
   const cy = a.y + t * aby;
   return (px - cx) * (px - cx) + (py - cy) * (py - cy);
+}
+
+/**
+ * A CURVED link (`smooth` / `bezier`) without manual waypoints: the renderer
+ * keeps its `points` as the painted, sampled curve (16-odd points along it), so
+ * none of its interior points is a vertex a user placed — vertex tools there
+ * showed 15 "−" and 16 "+" handles on one plain two-node edge.
+ */
+function isSampledCurve(link: LinkModel): boolean {
+  return (link.pathType === 'smooth' || link.pathType === 'bezier') && link.getMetadata('hasManualWaypoints') !== true;
+}
+
+/** The point halfway along a polyline, by arc length. */
+function polylineMidpoint(points: Point[]): Point {
+  let total = 0;
+  for (let i = 1; i < points.length; i++) total += Math.hypot(points[i]!.x - points[i - 1]!.x, points[i]!.y - points[i - 1]!.y);
+  let remaining = total / 2;
+  for (let i = 1; i < points.length; i++) {
+    const a = points[i - 1]!;
+    const b = points[i]!;
+    const len = Math.hypot(b.x - a.x, b.y - a.y);
+    if (remaining <= len) {
+      const t = len > 0 ? remaining / len : 0;
+      return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+    }
+    remaining -= len;
+  }
+  return { ...points[0]! };
 }
 
 const HALO_ORDER: HaloAction[] = ['connect', 'clone', 'fork', 'delete'];
@@ -515,6 +543,13 @@ export class SelectionToolsController {
     return this.gesture?.kind ?? null;
   }
 
+  /** The node the in-flight gesture is acting on (`null` when idle). Lets a host
+   *  exclude it from a snap's sibling set — a box must not snap to itself. */
+  activeGestureNodeId(): string | null {
+    const g = this.gesture as { nodeId?: string } | null;
+    return g?.nodeId ?? null;
+  }
+
   // ==========================================================================
   // The layer
   // ==========================================================================
@@ -717,8 +752,23 @@ export class SelectionToolsController {
         label: 'Reconnect target',
       });
 
+      // A curved link with no bends of its own: its points are the PAINTED,
+      // sampled curve, not vertices — one "+" on the drawn line, no "−".
+      if (isSampledCurve(link)) {
+        handles.push({
+          id: `vertex-add-${link.id}-0`,
+          kind: 'vertex-add',
+          index: 0,
+          linkId: link.id,
+          world: polylineMidpoint(points),
+          hitRadius: hitRadius * 0.9,
+          cursor: 'copy',
+          label: 'Add vertex on segment 1',
+        });
+      }
+
       // One "+" per segment midpoint → add a vertex there.
-      for (let i = 0; i < points.length - 1; i++) {
+      for (let i = 0; !isSampledCurve(link) && i < points.length - 1; i++) {
         const a = points[i]!;
         const b = points[i + 1]!;
         handles.push({
@@ -734,7 +784,7 @@ export class SelectionToolsController {
       }
 
       // One "−" per interior vertex → remove it.
-      for (let i = 1; i < points.length - 1; i++) {
+      for (let i = 1; !isSampledCurve(link) && i < points.length - 1; i++) {
         handles.push({
           id: `vertex-remove-${link.id}-${i}`,
           kind: 'vertex-remove',
@@ -896,7 +946,7 @@ export class SelectionToolsController {
    * Live-resize the node (direct model mutation, like the drag tool: smooth, no
    * command churn — the single undo entry is minted at {@link endGesture}).
    * `snap` optionally quantises the resulting box (grid / alignment) — the host
-   * passes the SnapController's hook so Card 6 composes with Card 5.
+   * passes the SnapController's hook so snapping composes with resizing.
    */
   updateResize(
     engine: DiagramEngine,
@@ -1054,7 +1104,7 @@ export class SelectionToolsController {
    * End the active gesture and return the ONE command that makes it undoable
    * (null for a no-op gesture). The model already sits at its final state — the
    * command re-applies it (a no-op) and records the inverse, exactly like the
-   * wave-3 node-drag commit.
+   * node-drag commit.
    */
   endGesture(engine: DiagramEngine): Command | null {
     const gesture = this.gesture;
@@ -1155,6 +1205,11 @@ export class SelectionToolsController {
 
     const points = link.points.map((p: Point) => ({ ...p }));
     if (handle.index < 0 || handle.index >= points.length - 1) return null;
+
+    // A sampled curve has two real vertices, its ends: the new bend goes between them.
+    if (isSampledCurve(link)) {
+      return new SetLinkPointsCommand(link.id, [points[0]!, { ...handle.world }, points[points.length - 1]!], points);
+    }
 
     const next = [...points];
     next.splice(handle.index + 1, 0, { ...handle.world });

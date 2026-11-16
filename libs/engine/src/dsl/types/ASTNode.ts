@@ -12,6 +12,7 @@ export type DiagramType = 'flowchart' | 'bpmn' | 'erd' | 'classDiagram';
  * Node shape type mapping to Mermaid syntax
  */
 export type NodeShape =
+  | 'text'               // @{ shape: text } — words, no box
   | 'rectangle'          // [text]
   | 'rounded-rectangle'  // (text)
   | 'stadium'            // ([text])
@@ -21,8 +22,10 @@ export type NodeShape =
   | 'asymmetric'         // >text]
   | 'rhombus'            // {text}
   | 'hexagon'            // {{text}}
-  | 'trapezoid'          // [/text/]
-  | 'trapezoid-alt';     // [\text\]
+  | 'trapezoid'          // [/text\]  — wide bottom
+  | 'trapezoid-alt'      // [\text/]  — wide top
+  | 'parallelogram'      // [/text/]  — leans right
+  | 'parallelogram-alt'; // [\text\]  — leans left
 
 /**
  * Link/Edge type mapping
@@ -37,6 +40,25 @@ export type LinkType =
   | 'bidirectional'      // <-->
   | 'circle-edge'        // --o
   | 'cross-edge';        // --x
+
+/** What one END of a Mermaid edge draws: `>` an arrow, `o` a circle, `x` a cross. */
+export type EdgeEnd = 'none' | 'arrow' | 'circle' | 'cross';
+
+/**
+ * The two ends of a Mermaid edge, Mermaid's way (flowDb.destructLink): the LAST
+ * character names the target end (`>` arrow, `o` circle, `x` cross, else none),
+ * and a FIRST character that matches it (`<`, `o`, `x`) puts the same marker on
+ * the source end — `<-->`, `o--o`, `x-.-x`. A first character that does not
+ * match is ignored (`o-->` is a plain arrow), as Mermaid ignores it.
+ */
+export function mermaidEdgeEnds(linkText: string): { start: EdgeEnd; end: EdgeEnd } {
+  const text = linkText.trim();
+  const last = text[text.length - 1];
+  const end: EdgeEnd = last === '>' ? 'arrow' : last === 'o' ? 'circle' : last === 'x' ? 'cross' : 'none';
+  const opener: Record<EdgeEnd, string> = { arrow: '<', circle: 'o', cross: 'x', none: '' };
+  const start: EdgeEnd = end !== 'none' && text.length > 1 && text[0] === opener[end] ? end : 'none';
+  return { start, end };
+}
 
 /**
  * Base AST Node
@@ -103,6 +125,8 @@ export interface EdgeDefinitionNode extends ASTNode {
   source: string;
   target: string;
   linkType: LinkType;
+  /** The markers at each end (`--o`, `<-->`, `---`…); absent = Mermaid's `-->`. */
+  ends?: { start: EdgeEnd; end: EdgeEnd };
   label?: string;
   style?: StyleProperties;
   /**
@@ -164,6 +188,8 @@ export interface LinkStyleNode extends ASTNode {
   type: 'LinkStyle';
   indices: number[] | 'default';
   properties: StyleProperties;
+  /** `interpolate <curve>` — linear, step, stepBefore, stepAfter, basis, … */
+  interpolate?: string;
 }
 
 /** `click a "https://…" "tooltip"` — a node's navigation target. */
@@ -181,7 +207,9 @@ export interface ClickNode extends ASTNode {
  */
 export interface GrafloriaDirectiveNode extends ASTNode {
   type: 'GrafloriaDirective';
-  target: 'node' | 'edge';
+  /** node / edge / group properties, `at` — an exact position and size, `layout` — how
+   *  the diagram is arranged, `near` — a note placed beside its target. */
+  target: 'node' | 'edge' | 'group' | 'at' | 'layout' | 'near';
   ids: string[];
   properties: Record<string, string>;
 }

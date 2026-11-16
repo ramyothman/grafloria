@@ -1,6 +1,7 @@
 // Command interface for undo/redo system
 
 import { generateId } from '../utils';
+import { engineNow } from '../utils/deterministic';
 
 // Forward declarations - will be defined when we create these classes
 export interface CommandContext {
@@ -25,7 +26,7 @@ export abstract class Command {
   constructor(name: string) {
     this.id = generateId();
     this.name = name;
-    this.timestamp = Date.now();
+    this.timestamp = engineNow();
   }
 
   /**
@@ -56,6 +57,19 @@ export abstract class Command {
    * Check if command can be undone
    */
   canUndo(context: CommandContext): boolean {
+    return true;
+  }
+
+  /**
+   * Does this command belong on the undo stack AT ALL?
+   *
+   * `canUndo(context)` is a state probe ("can I undo RIGHT NOW?") consulted at
+   * undo time — many commands answer it from live diagram state. This is the
+   * static declaration consulted at EXECUTE time: a non-mutating command
+   * (Copy) answers false and never enters history, so undo never lands on an
+   * entry it cannot undo.
+   */
+  isUndoable(): boolean {
     return true;
   }
 

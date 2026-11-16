@@ -20,6 +20,9 @@ import type { DiagramModel } from '../models/DiagramModel';
 import type { GroupModel, CollapsedState } from '../models/GroupModel';
 import type { LinkModel } from '../models/LinkModel';
 import { NodeModel } from '../models/NodeModel';
+import { SwimlaneService } from './SwimlaneService';
+import { poolOfLane } from './confinement';
+import { ensureSideAnchorPort } from '../ports/side-anchor';
 
 /** Metadata key stamped on a placeholder node so it can be recognised/filtered. */
 export const PROXY_NODE_GROUP_KEY = '__collapsedGroupId';
@@ -29,6 +32,10 @@ export const PROXY_LINK_GROUP_KEY = '__proxyForGroup';
 /** Default placeholder box the group shrinks to when collapsed. */
 const PLACEHOLDER_WIDTH = 180;
 const PLACEHOLDER_HEIGHT = 44;
+/** A folded LANE's thickness across its pool's band axis. */
+export const COLLAPSED_LANE_SIZE = 44;
+/** Metadata key on a folded lane's placeholder: it is a band of its pool, not a box. */
+export const LANE_BAND_KEY = '__laneBand';
 
 /** Info handed to a caller's proxy-label hook. */
 export interface ProxyLabelInfo {
@@ -64,10 +71,12 @@ export class GroupCollapseService {
     }
 
     const memberNodeIds = this.collectMemberNodeIds(group);
+    // A lane folds to a band of its pool — even an empty one, which still needs its title band.
+    const pool = poolOfLane(this.diagram, group);
 
     // Nothing to hide → keep it lightweight (old flag-only behaviour), but still
     // record an (empty) snapshot so expand() knows this was a managed collapse.
-    if (memberNodeIds.size === 0) {
+    if (memberNodeIds.size === 0 && !pool) {
       group.collapse();
       this.setCollapsedState(group, {
         proxyNodeId: '',
@@ -94,16 +103,31 @@ export class GroupCollapseService {
       }
     }
 
-    // 2) Spawn the placeholder "group-as-node" at the group's top-left.
+    // 2) Spawn the placeholder "group-as-node" at the group's top-left. A lane's
+    //    placeholder IS its folded band: as long as the lane, COLLAPSED_LANE_SIZE thick.
     const frame = group.getOuterBounds();
+    const horizontal = pool?.laneConfig?.orientation !== 'vertical';
+    const placeholderSize = !pool
+      ? { width: PLACEHOLDER_WIDTH, height: PLACEHOLDER_HEIGHT }
+      : horizontal
+        ? { width: frame.width, height: COLLAPSED_LANE_SIZE }
+        : { width: COLLAPSED_LANE_SIZE, height: frame.height };
     const placeholder = new NodeModel({
       type: 'group-collapsed',
       position: { x: frame.x, y: frame.y },
-      size: { width: PLACEHOLDER_WIDTH, height: PLACEHOLDER_HEIGHT },
+      size: placeholderSize,
     });
     placeholder.setMetadata(PROXY_NODE_GROUP_KEY, group.id);
     placeholder.setMetadata('__isGroupProxy', true);
-    placeholder.setData('label', group.name);
+    if (pool) {
+      placeholder.setMetadata(LANE_BAND_KEY, true);
+      // Drawn see-through: the band you see is the folded lane's own frame, under
+      // the links — a placeholder painted over them hid every line crossing the
+      // folded lane, so a link to the lane AFTER it seemed to end at the band.
+      placeholder.setStyle({ fill: 'none', stroke: 'none' });
+    }
+    // A folded lane's name is already on its band (the lane frame's own title).
+    if (!pool) placeholder.setData('label', group.name);
     this.diagram.addNode(placeholder);
 
     // 3) Partition member-incident links and aggregate boundary crossings.
@@ -111,7 +135,8 @@ export class GroupCollapseService {
       group,
       memberNodeIds,
       placeholder,
-      options
+      options,
+      pool ? (horizontal ? 'horizontal' : 'vertical') : undefined
     );
 
     // 4) Hide members (they keep their absolute positions, just invisible).
@@ -124,14 +149,29 @@ export class GroupCollapseService {
       }
     }
 
-    // 5) Flag + shrink the group to the placeholder rectangle.
+    // 5) Flag + shrink the group to the placeholder rectangle. A lane instead
+    //    pins its band to the folded size and its pool gives the space back, so
+    //    the bands after it close up and every other lane keeps its size.
     group.collapse();
-    group.setFrame({
-      x: frame.x,
-      y: frame.y,
-      width: PLACEHOLDER_WIDTH,
-      height: PLACEHOLDER_HEIGHT,
-    });
+    let lane: CollapsedState['lane'];
+    if (pool && group.laneConfig) {
+      const crossSize = horizontal ? frame.height : frame.width;
+      const nested = group.parentGroupId !== pool.id; // a sub-lane: its lane shrinks with the pool
+      lane = { poolId: pool.id, crossSize, prevFixedSize: group.laneConfig.fixedSize, origin: { x: frame.x, y: frame.y }, ...(nested ? { nested } : {}) };
+      if (nested) {
+        new SwimlaneService(this.diagram).setLaneSize(pool, group.id, COLLAPSED_LANE_SIZE);
+      } else {
+        group.laneConfig = { ...group.laneConfig, fixedSize: COLLAPSED_LANE_SIZE };
+        this.growPool(pool, horizontal, COLLAPSED_LANE_SIZE - crossSize);
+      }
+    } else {
+      group.setFrame({
+        x: frame.x,
+        y: frame.y,
+        width: PLACEHOLDER_WIDTH,
+        height: PLACEHOLDER_HEIGHT,
+      });
+    }
 
     this.setCollapsedState(group, {
       proxyNodeId: placeholder.id,
@@ -140,7 +180,10 @@ export class GroupCollapseService {
       hiddenNodes,
       removedLinks,
       proxyLinks,
+      ...(lane ? { lane } : {}),
     });
+    // The pool re-tiles once the band knows its placeholder (reflow keeps it on the band).
+    if (pool) new SwimlaneService(this.diagram).reflow(pool);
 
     // Derived port registries changed (removed/re-homed links).
     this.diagram.reconcilePortConnections();
@@ -177,6 +220,17 @@ export class GroupCollapseService {
       }
       link.deleteMetadata(PROXY_LINK_GROUP_KEY);
       link.deleteMetadata('__proxyAggregateCount');
+      // A folded lane's link: the other end's own port and the link's own
+      // attachment setting come back too.
+      if (entry.otherPortId !== undefined) {
+        const otherNodeId = this.diagram.getNodeByPortId(entry.otherPortId)?.id;
+        if (entry.end === 'source') link.setTargetPort(entry.otherPortId, otherNodeId);
+        else link.setSourcePort(entry.otherPortId, otherNodeId);
+      }
+      if (entry.prevConnectionPoint !== undefined) {
+        if (entry.prevConnectionPoint === null) link.deleteMetadata('connectionPoint');
+        else link.setMetadata('connectionPoint', entry.prevConnectionPoint);
+      }
     }
 
     // 2) Re-create the links removed at collapse time (internal + aggregated).
@@ -189,23 +243,78 @@ export class GroupCollapseService {
       this.diagram.removeNode(state.proxyNodeId);
     }
 
-    // 4) Restore member positions + visibility.
+    // 4) A folded lane gets its band back: its pool grows by it again and
+    //    re-tiles. Its members return relative to where the lane is NOW — the
+    //    pool may have moved while it was folded.
+    const pool = state.lane ? this.diagram.getGroup(state.lane.poolId) : undefined;
+    let shift = { x: 0, y: 0 };
+    if (state.lane && pool && group.laneConfig) {
+      const horizontal = pool.laneConfig?.orientation !== 'vertical';
+      const now = group.getOuterBounds();
+      if (state.lane.nested) {
+        // A sub-lane gets its band back the way it gave it: its lane and the pool grow.
+        new SwimlaneService(this.diagram).setLaneSize(pool, group.id, state.lane.crossSize);
+      } else {
+        const { fixedSize: _folded, ...rest } = group.laneConfig;
+        group.laneConfig = state.lane.prevFixedSize === undefined ? rest : { ...rest, fixedSize: state.lane.prevFixedSize };
+        this.growPool(pool, horizontal, state.lane.crossSize - (horizontal ? now.height : now.width));
+      }
+      new SwimlaneService(this.diagram).reflow(pool);
+      const back = group.getOuterBounds();
+      shift = { x: back.x - state.lane.origin.x, y: back.y - state.lane.origin.y };
+    }
+
+    // 5) Restore member positions + visibility.
     for (const [nodeId, pos] of Object.entries(state.savedPositions)) {
-      this.diagram.getNode(nodeId)?.setPosition(pos.x, pos.y);
+      this.diagram.getNode(nodeId)?.setPosition(pos.x + shift.x, pos.y + shift.y);
     }
     for (const { nodeId, prevVisible } of state.hiddenNodes) {
       this.diagram.getNode(nodeId)?.setState({ visible: prevVisible });
     }
 
-    // 5) Restore the group's exact prior geometry.
-    if (state.savedGeometry) {
+    // 6) Restore the group's exact prior geometry (a lane's band was re-tiled above).
+    if (state.savedGeometry && !(state.lane && pool)) {
       group.restoreGeometry(state.savedGeometry);
     }
 
     group.expand();
     this.setCollapsedState(group, undefined);
+    // A split lane's sub-lanes are tiled only while it is unfolded.
+    if (pool) new SwimlaneService(this.diagram).reflow(pool);
 
     this.diagram.reconcilePortConnections();
+  }
+
+  /** The side of `node` that faces a folded lane's band. */
+  private sideFacing(node: NodeModel, placeholder: NodeModel, band: 'horizontal' | 'vertical'): 'top' | 'right' | 'bottom' | 'left' {
+    if (band === 'horizontal') {
+      return node.position.y + node.size.height / 2 < placeholder.position.y + placeholder.size.height / 2 ? 'bottom' : 'top';
+    }
+    return node.position.x + node.size.width / 2 < placeholder.position.x + placeholder.size.width / 2 ? 'right' : 'left';
+  }
+
+  /** The port on a folded lane's band facing `externalNodeId`, across from its centre. */
+  private bandAnchor(placeholder: NodeModel, externalNodeId: string, band: 'horizontal' | 'vertical', direction: 'in' | 'out'): string | null {
+    const other = this.diagram.getNode(externalNodeId);
+    if (!other) return null;
+    const c = { x: other.position.x + other.size.width / 2, y: other.position.y + other.size.height / 2 };
+    const { x, y } = placeholder.position;
+    const { width: w, height: h } = placeholder.size;
+    // A link into the lane and one out of it, to the same step, would meet the
+    // band at one point and draw as one line with two arrows: they sit apart.
+    const shift = direction === 'in' ? -12 : 12;
+    const along = (v: number, len: number) => Math.round(Math.max(12, Math.min(len - 12, v + shift)));
+    const handle =
+      band === 'horizontal'
+        ? `${c.y < y + h / 2 ? 'top' : 'bottom'}@${along(c.x - x, w)}`
+        : `${c.x < x + w / 2 ? 'left' : 'right'}@${along(c.y - y, h)}`;
+    return ensureSideAnchorPort(placeholder, handle);
+  }
+
+  /** Grow (or shrink, with a negative `by`) a pool along the axis its lanes stack on. */
+  private growPool(pool: GroupModel, horizontal: boolean, by: number): void {
+    const b = pool.getOuterBounds();
+    pool.setFrame(horizontal ? { ...b, height: Math.max(0, b.height + by) } : { ...b, width: Math.max(0, b.width + by) });
   }
 
   /**
@@ -218,7 +327,8 @@ export class GroupCollapseService {
     group: GroupModel,
     memberNodeIds: Set<string>,
     placeholder: NodeModel,
-    options?: CollapseOptions
+    options?: CollapseOptions,
+    band?: 'horizontal' | 'vertical'
   ): { removedLinks: any[]; proxyLinks: CollapsedState['proxyLinks'] } {
     const removedLinks: any[] = [];
     const buckets = new Map<
@@ -263,11 +373,16 @@ export class GroupCollapseService {
       const originalNodeId = memberEnd === 'source' ? survivor.sourceNodeId : survivor.targetNodeId;
 
       // Placeholder attachment: source side for outgoing, target side for incoming.
+      // A folded lane's band is long: the link meets it on the side facing the
+      // other end, right across from it, instead of travelling to the band's end.
       const placeholderPort =
         direction === 'out'
           ? placeholder.getPortBySide('right')
           : placeholder.getPortBySide('left');
-      const portId = placeholderPort?.id ?? placeholder.getPorts()[0]?.id;
+      const portId =
+        (band && this.bandAnchor(placeholder, externalNodeId, band, direction)) ??
+        placeholderPort?.id ??
+        placeholder.getPorts()[0]?.id;
 
       if (memberEnd === 'source') {
         survivor.setSourcePort(portId!, placeholder.id);
@@ -293,12 +408,30 @@ export class GroupCollapseService {
         survivor.addLabel({ id: `proxy-agg-${survivor.id}`, text: labelText, position: 0.5 });
       }
 
+      // A folded lane's link is pinned port to port: the band end faces the other
+      // node (above), and the other end turns to face the band — the automatic
+      // side choice compares centres and reaches for the far end of a long band.
+      let pinned: { otherPortId?: string; prevConnectionPoint?: string | null } = {};
+      if (band) {
+        const other = this.diagram.getNode(externalNodeId);
+        const otherPort = other ? other.getPortBySide(this.sideFacing(other, placeholder, band)) : undefined;
+        const otherEnd: 'source' | 'target' = memberEnd === 'source' ? 'target' : 'source';
+        const otherPortId = otherEnd === 'source' ? survivor.sourcePortId : survivor.targetPortId;
+        pinned = { otherPortId, prevConnectionPoint: (survivor.getMetadata('connectionPoint') as string | undefined) ?? null };
+        if (other && otherPort) {
+          if (otherEnd === 'source') survivor.setSourcePort(otherPort.id, other.id);
+          else survivor.setTargetPort(otherPort.id, other.id);
+        }
+        survivor.setMetadata('connectionPoint', 'port');
+      }
+
       proxyLinks.push({
         linkId: survivor.id,
         end: memberEnd,
         originalPortId,
         originalNodeId,
         aggregatedCount: links.length,
+        ...pinned,
       });
     }
 

@@ -74,12 +74,33 @@ export class ClipboardManager {
   }
 
   /**
+   * Load a payload a HOST kept — read back from the system clipboard, or from
+   * its own format — so the next paste pastes it. The same shape `get()` gives;
+   * it starts a fresh paste cascade, like a copy does.
+   */
+  set(data: ClipboardData): void {
+    if (!data || !Array.isArray(data.nodes)) throw new Error('ClipboardManager.set: not a clipboard payload (no nodes array)');
+    const payload: ClipboardData = {
+      nodes: data.nodes,
+      links: Array.isArray(data.links) ? data.links : [],
+      groups: Array.isArray(data.groups) ? data.groups : [],
+      timestamp: data.timestamp ?? Date.now(),
+      sourceDiagramId: data.sourceDiagramId ?? data.sourceDigramId,
+      sourceDigramId: data.sourceDiagramId ?? data.sourceDigramId,
+    };
+    this.clipboard = payload;
+    this.pasteSerial = 0;
+    this.history.unshift(payload);
+    if (this.history.length > this.maxHistorySize) this.history.pop();
+  }
+
+  /**
    * Claim the next paste slot for the CURRENT clipboard payload (1-based).
    *
    * Repeat-pasting the same copy must cascade — the clipboard's serialized
    * positions are frozen at copy time, so a constant default offset lands
    * every paste on the exact same pixels and "paste" appears to work only
-   * once (live report). Each PasteCommand claims its slot once (stable
+   * once. Each PasteCommand claims its slot once (stable
    * across redo); a new copy() resets the cascade.
    */
   claimPasteSlot(): number {

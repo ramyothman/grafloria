@@ -19,13 +19,13 @@ export interface SerializedGroup extends SerializedEntity {
   members: string[];
   isCollapsed: boolean;
   bounds?: { x: number; y: number; width: number; height: number };
-  layoutType?: LayoutType; // Phase 1.7
-  layoutConfig?: LayoutConfig; // Phase 1.7
+  layoutType?: LayoutType;
+  layoutConfig?: LayoutConfig;
   position?: { x: number; y: number }; // group geometry
   size?: { width: number; height: number; depth: number }; // group geometry
-  parentGroupId?: string; // Wave-2: compound-graph containment (nesting)
+  parentGroupId?: string; // Compound-graph containment (nesting)
 
-  // Wave-5 Card 3: subflow geometry — auto-fit padding, title band, z-order,
+  // Subflow geometry — auto-fit padding, title band, z-order,
   // fit mode and child-extent constraint. All optional so groups that never
   // touch these serialize byte-for-byte as before (round-trip invariant).
   padding?: GroupPadding;
@@ -34,25 +34,25 @@ export interface SerializedGroup extends SerializedEntity {
   fitMode?: GroupFitMode;
   constrainChildren?: boolean;
 
-  // Wave-5 Card 4: everything needed to expand a collapsed group back to
+  // Everything needed to expand a collapsed group back to
   // exactly its prior state. Present iff the group is currently collapsed.
   collapsedState?: CollapsedState;
 
-  // Wave-5 Card 5: per-group compound-layout intent (the GroupInfo bits that
+  // Per-group compound-layout intent (the GroupInfo bits that
   // belong to the group itself and should persist).
   subgraphLayout?: SubgraphGroupConfig;
 
-  // Wave-5 Card 6: swimlane/pool band config (present only on pools & lanes).
+  // Swimlane/pool band config (present only on pools & lanes).
   laneConfig?: LaneConfig;
 
-  // Wave-5 Card 7: serialized declarative membership rule (auto-membership).
+  // Serialized declarative membership rule (auto-membership).
   membershipRule?: MembershipRule;
-  // Wave-5 Card 7: capacity / WIP limit (0+; present only when set).
+  // Capacity / WIP limit (0+; present only when set).
   capacity?: number;
 }
 
 /**
- * Wave-5 Card 7: a SERIALIZABLE declarative membership predicate over a node's
+ * A SERIALIZABLE declarative membership predicate over a node's
  * `data` (never eval'd code). Leaves match one field with an operator; branches
  * compose with all/any/not. Kept intentionally small and closed so it round-
  * trips and can be reasoned about / edited as data.
@@ -72,18 +72,18 @@ export interface MembershipLeaf {
 }
 
 /**
- * Wave-5 Card 5: a group's own compound-layout configuration — the subset of
+ * A group's own compound-layout configuration — the subset of
  * the GroupInfo layout contract that is intrinsic to the group and round-trips.
- * Padding/header come from Card 3 (padding/headerHeight); size clamps come from
- * fitToContents.
+ * Padding and header come from the group's `padding`/`headerHeight`; size clamps
+ * come from fitToContents.
  */
 export interface SubgraphGroupConfig {
   /**
    * Algorithm for THIS group's contents. 'inherit' uses the parent/default.
    *
-   * Wave 7 Card 4: any name in the layout registry works here (force, spectral,
-   * community, or an extension-registered engine), not just the dagre|elk pair
-   * wave 5 hard-coded — nested layout resolves the name against the registry.
+   * Any name in the layout registry works here (dagre, elk, force, spectral,
+   * community, or an extension-registered engine) — nested layout resolves the
+   * name against the registry.
    * An unknown name falls back to the built-in grid rather than throwing.
    */
   algorithm?: 'dagre' | 'elk' | 'grid' | 'inherit' | (string & {});
@@ -94,7 +94,7 @@ export interface SubgraphGroupConfig {
 }
 
 /**
- * Wave-5 Card 6: swimlanes & pools as a GENERIC banded group (not BPMN-named).
+ * Swimlanes & pools as a GENERIC banded group (not BPMN-named).
  * A `pool` group tiles its child `lane` groups into bands along one axis; each
  * `lane` is an ordinary group (so drop-to-assign, membership, constraints all
  * reuse the existing machinery). This is intrinsic band config that round-trips.
@@ -108,21 +108,38 @@ export interface LaneConfig {
    * Set on the pool; lanes carry a copy for convenience.
    */
   orientation: 'horizontal' | 'vertical';
-  /** Pool only: ordered child lane group ids (band order). */
+  /** A pool's lanes, or a SPLIT lane's sub-lanes: ordered child lane group ids (band order). */
   laneOrder?: string[];
   /**
-   * Pool only: title-band thickness reserved along the main axis start (left for
-   * horizontal pools, top for vertical pools).
+   * A pool's (or a split lane's) title-band thickness reserved along the main
+   * axis start (left for horizontal pools, top for vertical pools).
    */
   headerSize?: number;
+  /**
+   * Pool only: PHASES — named stages across every lane, in order (columns along
+   * a horizontal pool's lanes, rows down a vertical pool's). See pool-phases.ts.
+   */
+  phases?: PoolPhase[];
+  /** Pool only: the phase header band's thickness (default 28; on top of a horizontal pool, left of a vertical one). */
+  phaseHeaderSize?: number;
   /** Lane only: relative cross-axis size when not fixed (default 1). */
   weight?: number;
   /** Lane only: absolute cross-axis size (pins the band, overrides weight). */
   fixedSize?: number;
 }
 
+/** One phase of a pool: a named stage across every lane. */
+export interface PoolPhase {
+  id: string;
+  name: string;
+  /** Its size along the lanes, in pixels (pins it). */
+  fixedSize?: number;
+  /** Its share of what the pinned phases leave (default 1). */
+  weight?: number;
+}
+
 /**
- * Wave-5 Card 4: the reversible snapshot captured when a group collapses.
+ * The reversible snapshot captured when a group collapses.
  * Stored (serialized) on the group so a collapsed diagram round-trips and can
  * be expanded losslessly after a save/load — not just within one session.
  */
@@ -155,10 +172,33 @@ export interface CollapsedState {
     originalPortId: string;
     originalNodeId?: string;
     aggregatedCount: number;
+    /**
+     * A folded LANE's link is pinned port to port while folded: the other end's
+     * port before it was turned to face the band, and the link's own
+     * `connectionPoint` metadata before it was pinned (null = it had none).
+     */
+    otherPortId?: string;
+    prevConnectionPoint?: string | null;
   }>;
+  /**
+   * A LANE folds to a band of its pool instead of a placeholder box: what expand
+   * needs to give the band its size back (the pool grows by it again) and to put
+   * the members back relative to where the lane is THEN (the pool may have moved).
+   */
+  lane?: {
+    poolId: string;
+    /** The lane's thickness across the band axis before it folded. */
+    crossSize: number;
+    /** Its pinned size before it folded (absent = it was weighted). */
+    prevFixedSize?: number;
+    /** The lane's top-left when it folded. */
+    origin: { x: number; y: number };
+    /** A sub-lane: its lane shrank and grows back with it (every lane pinned). */
+    nested?: boolean;
+  };
 }
 
-/** Wave-5 Card 3: per-side padding (a scalar expands to all four sides). */
+/** Per-side padding (a scalar expands to all four sides). */
 export type GroupPadding =
   | number
   | { top?: number; right?: number; bottom?: number; left?: number };
@@ -174,7 +214,7 @@ export const DEFAULT_GROUP_PADDING = 16;
 export const DEFAULT_GROUP_HEADER_HEIGHT = 24;
 
 /**
- * Wave-5 Card 3: how {@link GroupModel.fitToContents} reconciles the freshly
+ * How {@link GroupModel.fitToContents} reconciles the freshly
  * computed content rectangle with the group's current rectangle.
  * - `exact`      — snap to the content rectangle (default).
  * - `grow-only`  — never shrink below the current rectangle (union).
@@ -202,7 +242,7 @@ export interface FitToContentsOptions {
 }
 
 /**
- * Predicate used to gate group membership (Wave-2).
+ * Predicate used to gate group membership.
  * Return false to reject a candidate entity from joining the group.
  * @param candidateId - id of the node/group being added
  * @param group - the group the candidate would join
@@ -289,7 +329,7 @@ export class GroupModel extends DiagramEntity {
   }
 
   /**
-   * Whether `candidateId` may legally join this group (Wave-2).
+   * Whether `candidateId` may legally join this group.
    * Rejects self-membership, ancestor cycles (adding an ancestor group as a
    * member would create a containment loop), and candidates failing the
    * per-group `memberValidation` predicate. Node candidates only run the
@@ -332,7 +372,7 @@ export class GroupModel extends DiagramEntity {
   }
 
   /**
-   * Wave-5 Card 7: WIP state for the capacity limit. 'under' = room to spare,
+   * WIP state for the capacity limit. 'under' = room to spare,
    * 'full' = exactly at the limit (the visual warning threshold), 'over' = past
    * it (only reachable by lowering capacity below the current count). Returns
    * 'unlimited' when no capacity is set.
@@ -346,7 +386,7 @@ export class GroupModel extends DiagramEntity {
     return { count, capacity: this.capacity, state };
   }
 
-  /** Wave-5 Card 7: true when at or beyond the capacity limit (warning state). */
+  /** True when at or beyond the capacity limit (warning state). */
   isOverCapacity(): boolean {
     const s = this.getWipState().state;
     return s === 'full' || s === 'over';
@@ -398,7 +438,57 @@ export class GroupModel extends DiagramEntity {
     // changes. This used to require an explicit `autoLayout` metadata flag, which
     // meant the default behaviour of a layout container was "do nothing".
     this.requestLayout(dm);
+
+    // A member that joins from outside the frame is taken in — HERE, so every path
+    // (AddToGroupCommand, a drop, setGroups(), a kit or host calling this directly)
+    // behaves the same. Only the command used to do it.
+    if (dm) this.growFramesToTakeIn(dm, entityId);
   }
+
+  /**
+   * Whether a joining member may grow this group's frame. Frames that something
+   * else owns are left alone: a collapsed group, a layout container
+   * (`setLayout`), a swimlane or pool (`laneConfig`), a group that confines its
+   * members (`constrainChildren`: its frame is the extent they are kept inside),
+   * and a group drawn without a frame (`metadata.frameChrome === 'none'`, as
+   * dashboard boards are).
+   */
+  ownsItsFrame(): boolean {
+    return (
+      !this.isCollapsed &&
+      !this.hasLayout() &&
+      !this.laneConfig &&
+      this.constrainChildren !== true &&
+      this.getMetadata('frameChrome') !== 'none'
+    );
+  }
+
+  /**
+   * Take a joining member in: when it reaches outside this frame, grow the frame
+   * (grow-only, to the members plus padding and header band — an authored frame
+   * keeps its size and is only ever extended), then the enclosing frame if the
+   * grown one now reaches outside it, and so on. A member already inside the
+   * frame changes nothing, so an importer's or author's exact frame is left as
+   * it was drawn. Frames that are not their own (see {@link ownsItsFrame}) and
+   * a group with NO frame yet (left to whoever fits it: an importer, a layout,
+   * `fitToContents`) are not touched. Not during a system write: a remote or
+   * replayed membership arrives with the frame its origin computed.
+   */
+  private growFramesToTakeIn(dm: DiagramModel, memberId: string): void {
+    if (dm.inSystemWrite?.() || dm.blocksDocumentWrite?.()) return;
+    let reach = extentOf(dm, memberId);
+    const seen = new Set<string>();
+    let current: GroupModel | undefined = this;
+    while (reach && current && !seen.has(current.id)) {
+      seen.add(current.id);
+      if (!current.size || !current.ownsItsFrame()) return;
+      if (rectContains(current.getOuterBounds(), reach)) return;
+      if (!current.growToFitMembers(dm)) return;
+      reach = current.getOuterBounds();
+      current = current.parentGroupId ? dm.getGroup(current.parentGroupId) : undefined;
+    }
+  }
+
 
   /**
    * Remove member from group. When the member is a group whose parent is this
@@ -532,7 +622,7 @@ export class GroupModel extends DiagramEntity {
   }
 
   /**
-   * Set transient drag-hover highlight state and notify listeners (Wave-2).
+   * Set transient drag-hover highlight state and notify listeners.
    * Renderers/canvas can subscribe to 'hover:changed' to outline a drop target.
    */
   setHovered(hovered: boolean): void {
@@ -565,7 +655,7 @@ export class GroupModel extends DiagramEntity {
   }
 
   /**
-   * Wave-5 Card 4: set (or clear) the reversible collapse snapshot. Tracked as a
+   * Set (or clear) the reversible collapse snapshot. Tracked as a
    * change so the incremental diff-capture serializes it and undo/redo see it.
    */
   setCollapsedState(state: CollapsedState | undefined): void {
@@ -575,7 +665,7 @@ export class GroupModel extends DiagramEntity {
   }
 
   /**
-   * Set layout configuration (Phase 1.7)
+   * Set layout configuration
    * @param type - Layout type ('flexbox' or 'grid')
    * @param config - Layout configuration object
    */
@@ -595,7 +685,7 @@ export class GroupModel extends DiagramEntity {
   }
 
   /**
-   * Clear layout configuration (Phase 1.7)
+   * Clear layout configuration
    */
   clearLayout(): void {
     const oldType = this.layoutType;
@@ -611,7 +701,7 @@ export class GroupModel extends DiagramEntity {
   }
 
   /**
-   * Get layout configuration (Phase 1.7)
+   * Get layout configuration
    */
   getLayout(): { type: LayoutType; config?: LayoutConfig } {
     return {
@@ -621,14 +711,14 @@ export class GroupModel extends DiagramEntity {
   }
 
   /**
-   * Check if group has layout configured (Phase 1.7)
+   * Check if group has layout configured
    */
   hasLayout(): boolean {
     return this.layoutType !== 'none' && this.layoutConfig !== undefined;
   }
 
   /**
-   * Get layout as flexbox config (Phase 1.7)
+   * Get layout as flexbox config
    * @throws Error if layout is not flexbox
    */
   getFlexboxLayout(): FlexboxLayoutConfig {
@@ -639,7 +729,7 @@ export class GroupModel extends DiagramEntity {
   }
 
   /**
-   * Get layout as grid config (Phase 1.7)
+   * Get layout as grid config
    * @throws Error if layout is not grid
    */
   getGridLayout(): GridLayoutConfig {
@@ -801,6 +891,42 @@ export class GroupModel extends DiagramEntity {
   }
 
   /**
+   * Grow the frame just enough to take in every member, plus padding and the
+   * header band, without ever shrinking it. A group with no frame yet gets one
+   * fitted around its members. Writes nothing when the members already fit, so
+   * an unchanged frame records no change.
+   *
+   * @returns true when the frame changed.
+   */
+  growToFitMembers(diagram?: DiagramModel): boolean {
+    const dm = this.resolveDiagram(diagram);
+    if (!dm) return false;
+    const content = this.computeMemberExtent(dm);
+    if (!content) return false;
+    const pad = this.getPadding();
+    const fitted: GroupRect = {
+      x: content.x - pad.left,
+      y: content.y - pad.top - this.headerHeight,
+      width: content.width + pad.left + pad.right,
+      height: content.height + pad.top + pad.bottom + this.headerHeight,
+    };
+    const target = this.reconcileFit(fitted, 'grow-only');
+    if (this.size) {
+      const current = this.getOuterBounds();
+      if (
+        target.x === current.x &&
+        target.y === current.y &&
+        target.width === current.width &&
+        target.height === current.height
+      ) {
+        return false;
+      }
+    }
+    this.setFrame(target);
+    return true;
+  }
+
+  /**
    * Bounding box (world coords) of this group's members. Nodes contribute their
    * global bounds; member groups contribute their outer frame. Returns
    * undefined when nothing is positioned.
@@ -932,7 +1058,7 @@ export class GroupModel extends DiagramEntity {
   }
 
   /**
-   * Wave-5 Card 4: restore raw geometry (position + optional size + bounds)
+   * Restore raw geometry (position + optional size + bounds)
    * captured before a collapse. Unlike setFrame this permits size === undefined
    * so a group that had no explicit frame is restored to exactly that.
    */
@@ -1003,6 +1129,8 @@ export class GroupModel extends DiagramEntity {
    * every push that arrives DURING a pass is dropped, because that pass is already
    * producing the answer the push would ask for.
    */
+  /** The diagram the in-flight layout pass resolves members against. */
+  private layoutDiagram: DiagramModel | undefined;
   private layoutInFlight = false;
 
   /**
@@ -1035,7 +1163,7 @@ export class GroupModel extends DiagramEntity {
   }
 
   /**
-   * Apply layout to member nodes (Phase 1.7+)
+   * Apply layout to member nodes
    * Positions child nodes based on flex or grid layout configuration
    */
   applyLayout(diagram?: DiagramModel): void {
@@ -1069,6 +1197,7 @@ export class GroupModel extends DiagramEntity {
     }
 
     this.layoutInFlight = true;
+    this.layoutDiagram = diagramToUse;
     try {
       if (this.layoutType === 'flexbox') {
         this.applyFlexboxLayout(entities);
@@ -1077,6 +1206,7 @@ export class GroupModel extends DiagramEntity {
       }
     } finally {
       this.layoutInFlight = false;
+      this.layoutDiagram = undefined;
     }
   }
 
@@ -1112,12 +1242,51 @@ export class GroupModel extends DiagramEntity {
       return;
     }
     const group = entity as GroupModel;
+    // C5: a member GROUP's frame is its contents' container, not a free rectangle —
+    // moving the frame alone left a plain nested group's members behind, outside
+    // it. Carry them (and any deeper frames) by the same delta first; a nested
+    // container with its own layout then reflows from its new frame anyway.
+    this.translateGroupContents(group, x - group.position.x, y - group.position.y);
     if (group.size) {
       group.setFrame({ x, y, width: group.size.width, height: group.size.height });
       return;
     }
     group.position = { x, y };
     group.requestLayout();
+  }
+
+  /**
+   * Move every member node of `group` (recursively, through nested groups) and
+   * every nested group frame by (dx, dy) — the frame of `group` itself excepted,
+   * the caller places that. Cycle-guarded; pinned (locked) nodes stay put.
+   */
+  private translateGroupContents(group: GroupModel, dx: number, dy: number): void {
+    const diagram = this.layoutDiagram ?? this.resolveDiagram();
+    if (!diagram || (dx === 0 && dy === 0)) return;
+    const seen = new Set<string>([group.id]);
+    const stack: GroupModel[] = [group];
+    while (stack.length) {
+      const g = stack.pop()!;
+      for (const id of g.members) {
+        const node = diagram.getNode(id);
+        if (node) {
+          if (!this.isPinned(node)) node.setPosition(node.position.x + dx, node.position.y + dy);
+          continue;
+        }
+        const child = diagram.getGroup(id);
+        if (!child || seen.has(child.id)) continue;
+        seen.add(child.id);
+        const b = child.getOuterBounds();
+        if (child.size) {
+          child.setFrame({ x: b.x + dx, y: b.y + dy, width: child.size.width, height: child.size.height });
+        } else {
+          child.position = { x: child.position.x + dx, y: child.position.y + dy };
+        }
+        // A nested container that reflows on its own already re-placed its members
+        // from the frame just written; translating them too would move them twice.
+        if (!(child.size && child.isAutoLayoutEnabled())) stack.push(child);
+      }
+    }
   }
 
   /**
@@ -1204,17 +1373,18 @@ export class GroupModel extends DiagramEntity {
     const ordered = this.orderFlexEntities(entities);
     const directed = isReverse ? ordered.slice().reverse() : ordered;
 
-    const startX = this.position.x + padding.left;
-    const startY = this.position.y + padding.top;
+    const box = this.layoutContentBox(padding);
+    const startX = box.x;
+    const startY = box.y;
 
     // Bootstrap 12-column path (rows only), unchanged.
     if (!isColumn && config.columns !== undefined && config.columns > 0 && this.size) {
-      this.applyColumnBasedLayout(directed, config, padding, startX, startY);
+      this.applyColumnBasedLayout(directed, config, box.width ?? 0, startX, startY);
       return;
     }
 
-    const contentWidth = this.size ? this.size.width - padding.left - padding.right : undefined;
-    const contentHeight = this.size ? this.size.height - padding.top - padding.bottom : undefined;
+    const contentWidth = box.width;
+    const contentHeight = box.height;
     const mainAvail = isColumn ? contentHeight : contentWidth;
     const crossAvail = isColumn ? contentWidth : contentHeight;
 
@@ -1393,7 +1563,7 @@ export class GroupModel extends DiagramEntity {
   private applyColumnBasedLayout(
     entities: Array<NodeModel | GroupModel>,
     config: FlexboxLayoutConfig,
-    padding: { top: number; right: number; bottom: number; left: number },
+    availableWidth: number,
     startX: number,
     startY: number
   ): void {
@@ -1401,9 +1571,6 @@ export class GroupModel extends DiagramEntity {
 
     const totalColumns = config.columns;
     const gap = typeof config.gap === 'number' ? config.gap : config.gap.column || 0;
-
-    // Available width for content (excluding padding)
-    const availableWidth = this.size.width - padding.left - padding.right;
 
     // Calculate column width (including gaps)
     const totalGaps = (totalColumns - 1) * gap;
@@ -1471,8 +1638,9 @@ export class GroupModel extends DiagramEntity {
     const rowGap = config.rowGap || 0;
     const padding = this.normalizePadding(config.padding);
 
-    const startX = this.position.x + padding.left;
-    const startY = this.position.y + padding.top;
+    const box = this.layoutContentBox(padding);
+    const startX = box.x;
+    const startY = box.y;
 
     // `templateRows` bounds a column-flow grid's row axis (CSS: column flow grows
     // COLUMNS, so the rows have to be finite). With none declared, fall back to
@@ -1484,23 +1652,43 @@ export class GroupModel extends DiagramEntity {
 
     // Track sizes.
     const rowCount = placements.reduce((m, p) => Math.max(m, p.row + p.rowSpan), 1);
-    const contentWidth = this.size ? this.size.width - padding.left - padding.right : undefined;
-    const contentHeight = this.size ? this.size.height - padding.top - padding.bottom : undefined;
+    const contentWidth = box.width;
+    const contentHeight = box.height;
 
     const rowTracks = Math.max(rowCount, templateRowCount || 0, 1);
 
-    const columnWidth =
-      contentWidth !== undefined
-        ? (contentWidth - columnGap * (columns - 1)) / columns
-        : entities.reduce((m, e) => Math.max(m, e.size?.width ?? 0), 0) || 100;
-    const rowHeight =
-      contentHeight !== undefined
-        ? (contentHeight - rowGap * (rowTracks - 1)) / rowTracks
-        : entities.reduce((m, e) => Math.max(m, e.size?.height ?? 0), 0) || 100;
+    // Track sizes. A fixed track (`120px`) is that wide; `fr`/`auto` tracks share
+    // what the content box has left — or, in an unsized container, take the
+    // largest member. Stretching declared `120px` columns over the frame's width
+    // made layout + fit converge forever instead of settling (S2, docs review v4).
+    const columnSizes = this.resolveGridTracks(
+      config.templateColumns,
+      columns,
+      columnGap,
+      contentWidth,
+      entities.reduce((m, e) => Math.max(m, e.size?.width ?? 0), 0) || 100
+    );
+    const rowSizes = this.resolveGridTracks(
+      config.templateRows ?? '',
+      rowTracks,
+      rowGap,
+      contentHeight,
+      entities.reduce((m, e) => Math.max(m, e.size?.height ?? 0), 0) || 100
+    );
+    const offsetOf = (sizes: number[], gap: number, index: number): number => {
+      let at = 0;
+      for (let i = 0; i < index; i++) at += sizes[i]! + gap;
+      return at;
+    };
+    const spanOf = (sizes: number[], gap: number, index: number, span: number): number => {
+      let total = 0;
+      for (let i = index; i < index + span; i++) total += sizes[i] ?? sizes[sizes.length - 1]!;
+      return total + gap * (span - 1);
+    };
 
     for (const { entity, row, column, rowSpan, columnSpan } of placements) {
-      const x = startX + column * (columnWidth + columnGap);
-      const y = startY + row * (rowHeight + rowGap);
+      const x = startX + offsetOf(columnSizes, columnGap, column);
+      const y = startY + offsetOf(rowSizes, rowGap, row);
 
       // Cell-filling is OPT-IN. CSS defaults `justify-items`/`align-items` to
       // stretch, but this engine's grid never resized anything, and silently
@@ -1513,8 +1701,8 @@ export class GroupModel extends DiagramEntity {
       if (stretchW || stretchH) {
         this.resizeEntity(
           entity,
-          stretchW ? columnWidth * columnSpan + columnGap * (columnSpan - 1) : undefined,
-          stretchH ? rowHeight * rowSpan + rowGap * (rowSpan - 1) : undefined
+          stretchW ? spanOf(columnSizes, columnGap, column, columnSpan) : undefined,
+          stretchH ? spanOf(rowSizes, rowGap, row, rowSpan) : undefined
         );
       }
 
@@ -1689,6 +1877,70 @@ export class GroupModel extends DiagramEntity {
   /**
    * Parse grid template columns to get column count
    */
+  /**
+   * The box a layout places members in: the frame's CONTENT box — inside its
+   * padding and below its title band ({@link getInnerBounds}) — inset by the
+   * layout's own padding. Width/height only when the frame has a size.
+   *
+   * Layouts used to start at the frame's OUTER corner, so members slid over the
+   * title band, and every fitToContents (which adds padding + header around the
+   * members) moved the frame up by that much and the layout followed it — the
+   * group climbed on each fit (S2, docs review v4).
+   */
+  private layoutContentBox(pad: { top: number; right: number; bottom: number; left: number }): {
+    x: number;
+    y: number;
+    width?: number;
+    height?: number;
+  } {
+    const inner = this.getInnerBounds();
+    return {
+      x: inner.x + pad.left,
+      y: inner.y + pad.top,
+      width: this.size ? Math.max(0, inner.width - pad.left - pad.right) : undefined,
+      height: this.size ? Math.max(0, inner.height - pad.top - pad.bottom) : undefined,
+    };
+  }
+
+  /**
+   * Resolve `count` track sizes from a template (`"120px 1fr auto"`,
+   * `"repeat(3, 1fr)"`). Fixed `px` tracks keep their size; `fr` (and `auto`,
+   * as 1fr) share the rest of `available`, or take `fallback` each when there is
+   * no available extent. Tracks past the template's end are flexible.
+   */
+  private resolveGridTracks(
+    template: string,
+    count: number,
+    gap: number,
+    available: number | undefined,
+    fallback: number
+  ): number[] {
+    const tokens: string[] = [];
+    const text = (template ?? '').trim();
+    const repeat = text.match(/^repeat\(\s*(\d+)\s*,\s*(.+)\)$/);
+    if (repeat) {
+      const inner = repeat[2]!.trim().split(/\s+/);
+      for (let i = 0; i < parseInt(repeat[1]!, 10); i++) tokens.push(...inner);
+    } else if (text) {
+      tokens.push(...text.split(/\s+/));
+    }
+    const tracks = Array.from({ length: count }, (_, i) => {
+      const t = tokens[i] ?? '1fr';
+      const px = t.match(/^(\d+(?:\.\d+)?)px$/);
+      if (px) return { fixed: parseFloat(px[1]!), fr: 0 };
+      const fr = t.match(/^(\d+(?:\.\d+)?)fr$/);
+      return { fixed: 0, fr: fr ? parseFloat(fr[1]!) : 1 };
+    });
+    const totalFr = tracks.reduce((m, t) => m + t.fr, 0);
+    const fixedSum = tracks.reduce((m, t) => m + t.fixed, 0);
+    const free = available !== undefined ? available - fixedSum - gap * (count - 1) : undefined;
+    return tracks.map((t) => {
+      if (t.fr === 0) return t.fixed;
+      if (free === undefined) return fallback * t.fr;
+      return totalFr > 0 ? (Math.max(0, free) * t.fr) / totalFr : 0;
+    });
+  }
+
   private parseGridColumns(templateColumns: string): number {
     // Simple parser - count space-separated values
     // Example: "1fr 1fr 1fr" = 3 columns, "repeat(3, 1fr)" = 3 columns
@@ -1838,4 +2090,28 @@ export class GroupModel extends DiagramEntity {
 
     return group;
   }
+}
+
+/** World rectangle of a member: a node's global bounds, a group's outer frame. */
+function extentOf(dm: DiagramModel, id: string): GroupRect | undefined {
+  const node = dm.getNode(id);
+  if (node) {
+    const b = node.getGlobalBounds();
+    return { x: b.left, y: b.top, width: b.right - b.left, height: b.bottom - b.top };
+  }
+  const group = dm.getGroup(id);
+  if (group) {
+    const r = group.getOuterBounds();
+    return r.width > 0 || r.height > 0 ? r : undefined;
+  }
+  return undefined;
+}
+
+function rectContains(outer: GroupRect, inner: GroupRect): boolean {
+  return (
+    inner.x >= outer.x &&
+    inner.y >= outer.y &&
+    inner.x + inner.width <= outer.x + outer.width &&
+    inner.y + inner.height <= outer.y + outer.height
+  );
 }

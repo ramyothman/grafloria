@@ -49,12 +49,13 @@ import { ReferentialIntegrity } from './integrity';
 import { LwwRegistry, type Stamp } from './lww';
 import { OpLog } from './op-log';
 import { UndoStack } from './undo';
+import type { HistoryOwner } from '../commands/history-owner';
 import { compareOps, setValueOf, type ActorId, type Op } from './op';
 
 export interface ReplicaOptions {
   /** This peer's identity. MUST be unique across peers — the total order depends on it. */
   actor: ActorId;
-  /** Called with each op this peer produces locally. Hand it to a transport (Card 5). */
+  /** Called with each op this peer produces locally. Hand it to a transport. */
   onLocalOp?: (op: Op) => void;
   /** Resume the Lamport clock from a persisted tail. */
   startClock?: number;
@@ -66,7 +67,7 @@ export interface ReplicaOptions {
  * Local edits to `diagram` are captured, appended to `log`, and handed to `onLocalOp`.
  * Remote ops arrive at `receive()`, are de-duplicated, applied, and NOT echoed back.
  */
-export class Replica {
+export class Replica implements HistoryOwner {
   readonly log = new OpLog();
 
   /**
@@ -112,6 +113,9 @@ export class Replica {
       this.basePorts.set(n.id, new Set(n.getPorts().map((p) => p.id)));
     }
     this.undoStack = new UndoStack(this.log, options.actor, (op) => this.applyLocalInverse(op));
+    // Undo is per actor from here on: the canvas's Ctrl+Z and engine.undo() reach this stack,
+    // so they take back my edits and never a peer's.
+    diagram.setHistoryOwner(this);
 
     this.capture = new OpCapture(diagram, {
       actor: options.actor,
@@ -255,13 +259,28 @@ export class Replica {
     return result;
   }
 
+  /**
+   * Open a step that spans events (a canvas press: down, moves, up). Everything I edit until
+   * the matching {@link endStep} is ONE undo step. Nested pairs flatten into the outermost.
+   * The canvas and the engine's CommandManager call these once this replica owns the
+   * diagram's undo — see `DiagramModel.setHistoryOwner`.
+   */
+  beginStep(): void {
+    this.undoStack.begin();
+  }
+
+  endStep(): void {
+    this.undoStack.end();
+    this.capture.silently(() => this.integrity.reconcile());
+  }
+
   /** Everything we know, in total order — the catch-up payload for a joining peer. */
   history(): readonly Op[] {
     return this.log.toArray();
   }
 
   /**
-   * Card 1: adopt a persisted op-log tail whose EFFECTS ARE ALREADY IN THE MODEL.
+   * Adopt a persisted op-log tail whose EFFECTS ARE ALREADY IN THE MODEL.
    *
    * This is `receive()`'s quiet twin, and the difference is the whole point. `receive()` is
    * for ops the model has not seen: it applies them. `adopt()` is for reopening a saved
@@ -284,6 +303,7 @@ export class Replica {
   }
 
   dispose(): void {
+    if (this.diagram.getHistoryOwner() === this) this.diagram.setHistoryOwner(null);
     this.capture.stop();
   }
 

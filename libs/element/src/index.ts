@@ -14,11 +14,15 @@
  */
 
 import { defineGrafloriaFlow } from './lib/grafloria-flow-element';
+import { registerDiagramKitTextKits } from './lib/diagram-kit/text-kits';
 
 export { GrafloriaFlowElement, defineGrafloriaFlow, GRAFLORIA_EVENTS } from './lib/grafloria-flow-element';
 
 export { Grafloria, render, renderStatic } from './lib/grafloria';
 export type { DiagramSpec, RenderSpec, RenderOptions } from './lib/grafloria';
+// The teardown order rule (the kit's hook first, then the caller's; both run):
+// render() and the framework dashboards compose their hooks through it.
+export { teardownInOrder } from './lib/teardown';
 
 // The LOAD front door — the other half of `DiagramSerializer.serialize()`.
 // `render(fromDocument(json), host)` is the one-liner; see lib/load.ts for why
@@ -140,6 +144,23 @@ export type { TokenBridge } from '@grafloria/renderer';
 // read them as such).
 export { portTypeRegistry, arePortDataTypesCompatible, portTypeColor } from '@grafloria/engine';
 export type { PortDataTypeDefinition } from '@grafloria/engine';
+
+// Stencils & shape masters — the Visio-style palette surface. Named here (not
+// left to the `export *` below) because this IS the documented way to browse and
+// register shapes: listStencils() feeds a palette, registerStencils() puts every
+// master behind engine.templateRegistry for NodeFactory to stamp.
+export {
+  listStencils,
+  builtInStencils,
+  getStencil,
+  registerStencils,
+  registerGeneratedTemplates,
+  generatedTemplates,
+  TemplateRegistry,
+  NodeFactory,
+  registerTemplateLibrary,
+} from '@grafloria/engine';
+export type { Stencil, NodeTemplate } from '@grafloria/engine';
 
 // Named style classes — the `named-class` layer of the cascade. The cascade read
 // this registry on every frame; nothing could WRITE to it.
@@ -500,9 +521,15 @@ export type {
 } from '@grafloria/renderer';
 
 // Swimlanes / pools / lanes — a whole containment model in the ENGINE that the
-// package re-exported none of. React Flow has no equivalent.
-export { SwimlaneService } from '@grafloria/engine';
-export type { Pool, LaneSpec, CreatePoolOptions, LaneOrientation } from '@grafloria/engine';
+// package re-exported none of. React Flow has no equivalent. `layoutPool` lays a
+// pool out as one unit (steps along the lanes by their links); `PoolEditCommand`
+// is the one undo step every lane edit and lane gesture records.
+export { SwimlaneService, PoolEditCommand, layoutPool } from '@grafloria/engine';
+export type {
+  Pool, LaneSpec, CreatePoolOptions, LaneOrientation,
+  SwimlaneServiceOptions, PoolSnapshot, PoolLayoutOptions,
+  PhaseSpec, PhaseBand, PoolPhase,
+} from '@grafloria/engine';
 
 // wave11/gallery BUG FIX — three more authoring seams were not on the embed.
 //
@@ -573,6 +600,23 @@ export {
   bindCardEditing,
   matchColumns,
   rowIndexFromY,
+  // Live join guidance (query-builder): score every other table's columns
+  // against a connection drag's source column and tint the kit rows by fit.
+  scoreMatch,
+  matchTier,
+  assignTiers,
+  singularize,
+  bindJoinGuidance,
+  ensureJoinGuidanceStyles,
+  JOIN_GUIDANCE_STYLE_ID,
+} from './lib/diagram-kit';
+export type {
+  JoinColumn,
+  JoinEnd,
+  MatchTier,
+  JoinGuidanceApi,
+  JoinGuidanceOptions,
+  JoinGuidanceHandle,
 } from './lib/diagram-kit';
 export type {
   ErColumn,
@@ -619,6 +663,19 @@ export type { HandleApi } from './lib/diagram-kit';
 // ===========================================================================
 export {
   bindDashboardGrid,
+  paintTabStrip,
+  tabStripReserve,
+  tabStripKey,
+  TAB_STRIP_HEIGHT,
+  TAB_DRAG_THRESHOLD,
+  normalizeCaption,
+  captionReserve,
+  captionBandHeight,
+  paintCaptionBand,
+  CAPTION_HEIGHT,
+  CAPTION_HEIGHT_SUBTITLE,
+  CAPTION_HEIGHT_TIGHT,
+  CAPTION_PASS_THROUGH,
   rowHeightFor,
   boardHeightFor,
   columnUnitFor,
@@ -630,6 +687,7 @@ export {
   buildCommitCommands,
   ensureDashboardKitStyles,
   DASHBOARD_KIT_STYLE_ID,
+  DASHBOARD_KIT_CSS,
   // The DATA-FIRST authoring API — the erDiagram()/umlDiagram() equivalent.
   dashboard,
   // …and the built-in renderers behind `kind`, so a dashboard is useful with
@@ -655,9 +713,19 @@ export type {
   DashboardOptions,
   DashboardSpec,
   DashboardSnapshot,
+  DragHandleOption,
+  DragGripOptions,
+  DropAnswer,
+  ListMoves,
   DashboardHandle,
   DashboardViewSpec,
   DashboardWidgetSpec,
+  SectionCaption,
+  SectionCaptionOptions,
+  TabsOptions,
+  TabPage,
+  SectionCaptionAction,
+  SectionCaptionFont,
   WidgetHandle,
   WidgetRenderer,
   KpiWidgetData,
@@ -668,6 +736,18 @@ export type {
   FunnelWidgetData,
   TableWidgetData,
 } from './lib/dashboard-kit';
+
+// The stencil kit — a Visio-style palette that drags shape masters onto the
+// canvas (T6/T7). Pairs with listStencils()/registerStencils() above.
+export { bindStencilPalette, bindShapeDataPanel, ensureStencilKitStyles } from './lib/stencil-kit';
+export type {
+  StencilPaletteApi,
+  StencilPaletteOptions,
+  StencilPaletteHandle,
+  ShapeDataPanelApi,
+  ShapeDataPanelOptions,
+  ShapeDataPanelHandle,
+} from './lib/stencil-kit';
 
 /* ==========================================================================
  * PHASE 0 — THE INVERSION.
@@ -756,3 +836,8 @@ export type {
 // `<script type="module" src="…/grafloria.js"></script>` + `<grafloria-flow>` in the
 // markup Just Work, which is the entire point of the card.
 defineGrafloriaFlow();
+
+// Side effect: Mermaid ER / class text loaded with `loadText` draws as the diagram
+// kit's table and class cards with their real markers, in every binding (they all
+// load this package). The renderer cannot import the kits; they register with it.
+registerDiagramKitTextKits();

@@ -75,6 +75,30 @@ describe('<grafloria-flow>', () => {
     expect(el.diagram!.getModel().getNodes().map((n) => n.id)).toEqual(['a']);
   });
 
+  it('highlight-connected: the selected node brings its lines forward — set at mount, and switched live', () => {
+    // renderer 0.4.7's `highlightConnected`, as an attribute: present = on, "trace" follows every path,
+    // a number is the depth, "false" (or removing it) turns it off.
+    const edges = [{ id: 'ab', source: 'a', target: 'b' }];
+    const el = mount(`<grafloria-flow highlight-connected nodes='${JSON.stringify(NODES)}' edges='${JSON.stringify(edges)}'></grafloria-flow>`);
+    const model = el.diagram!.getModel();
+    model.selectNode(model.getNode('a')!);
+    el.diagram!.renderNow();
+    const role = () => el.querySelector('[data-link-id="ab"]')?.getAttribute('data-connected') ?? null;
+    expect(el.diagram!.getHighlightConnected()).toBe(true);
+    expect(role()).toBe('out');
+    el.setAttribute('highlight-connected', 'trace');
+    expect(el.diagram!.getHighlightConnected()).toEqual({ depth: Infinity });
+    el.setAttribute('highlight-connected', '3');
+    expect(el.diagram!.getHighlightConnected()).toEqual({ depth: 3 });
+    el.setAttribute('highlight-connected', 'false');
+    el.diagram!.renderNow();
+    expect(el.diagram!.getHighlightConnected()).toBe(false);
+    expect(role()).toBeNull();
+    el.setAttribute('highlight-connected', '');
+    el.removeAttribute('highlight-connected');
+    expect(el.diagram!.getHighlightConnected()).toBe(false);
+  });
+
   it('ignores a malformed JSON attribute instead of taking the page down', () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
 
@@ -239,6 +263,30 @@ describe('Grafloria.render — the Mermaid-shaped API', () => {
     expect(target.querySelector('[data-vnode-key="node-a"]')).toBeTruthy();
     expect(diagram.getModel().getLinks()).toHaveLength(1);
     diagram.dispose();
+  });
+
+  it('no node gets a "not registered" outline — registered, custom, even a typo (v4 S7)', async () => {
+    registerNodeType('s7-card', (_node, element) => { element.textContent = 'card'; });
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+    const diagram = render(
+      {
+        nodes: [
+          { id: 'reg', type: 's7-card', position: { x: 40, y: 40 }, size: { width: 120, height: 60 } },
+          { id: 'flag', type: 's7-card', custom: true, position: { x: 240, y: 40 }, size: { width: 120, height: 60 } },
+          { id: 'typo', type: 'no-such-type', position: { x: 440, y: 40 }, size: { width: 120, height: 60 } },
+        ],
+      } as never,
+      target,
+      { highlighterConfig: true }
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    const warnings = Array.from(target.querySelectorAll('.grafloria-highlighter-validation')).map((r) => r.textContent);
+    expect(warnings).toEqual([]); // the canvas draws every node…
+    const codes = diagram.getEngine().validate().warnings.map((w) => (w as { code?: string }).code);
+    expect(codes).toContain('UNREGISTERED_NODE_TYPE'); // …and validate() still reports the typo
+    diagram.dispose();
+    unregisterNodeType('s7-card');
   });
 
   it('accepts a CSS selector and a JSON string', () => {

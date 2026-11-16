@@ -26,6 +26,8 @@ import type { NodeModel } from '../models/NodeModel';
 import type { PortModel } from '../models/PortModel';
 import { DSL } from '../dsl/DSL';
 import { canonicalStringify, fnv1aHex } from './DocumentEnvelope';
+import { withImportTextMeasure } from '../dsl/mermaid/import-layout';
+import type { MeasureText } from '../layout/architecture/text-metrics';
 
 export const GRAFLORIA_DOC_PREFIX = '%%grafloria:document ';
 export const GRAFLORIA_HASH_PREFIX = '%%grafloria:body-hash ';
@@ -36,6 +38,13 @@ export interface ExportTextOptions {
    * Mermaid and imports are best-effort DSL parses (the lossy boundary).
    */
   lossless?: boolean;
+  /**
+   * Write every node's and zone's exact position and size as
+   * `%%grafloria:at id x,y WxH` (default false). The sidecar already carries
+   * them; this is for a READABLE body that redraws the same picture on its own
+   * — the way an AI-drawn diagram is written for Grafloria.
+   */
+  positions?: boolean;
 }
 
 export interface ImportTextOptions extends DiagramLoadOptions {
@@ -47,6 +56,13 @@ export interface ImportTextOptions extends DiagramLoadOptions {
    *  - 'text': always parse the body text (ignore the sidecar).
    */
   prefer?: 'auto' | 'sidecar' | 'text';
+  /**
+   * How wide text draws, for a Mermaid import that sizes its boxes to their
+   * words as Mermaid does. The renderer's `loadText` passes its canvas; without
+   * one the import estimates (an average glyph of 0.6 em, as the renderer does
+   * where nothing measures).
+   */
+  measureText?: MeasureText;
 }
 
 export interface ImportTextResult {
@@ -66,9 +82,16 @@ export interface ImportTextResult {
   /**
    * Set to the diagram-type name when the body is a Mermaid type we recognise
    * but do not yet parse (sequenceDiagram, gantt, pie, …). The diagram is empty
-   * rather than a garbage flowchart. See docs/MERMAID-GAP-ANALYSIS.md Phase 0.
+   * rather than a garbage flowchart.
    */
   unsupported?: string;
+  /**
+   * When the body was parsed (`source: 'text'`): what in it could not be read —
+   * a line the parser skipped, an unclosed bracket or quote, a header that is
+   * not a diagram type — each naming its line. The import itself is best
+   * effort (the readable lines are in `diagram`); empty means the text is clean.
+   */
+  errors?: string[];
 }
 
 /** The body without any %%grafloria sidecar lines (what a human reads/edits). */
@@ -95,7 +118,7 @@ export function exportDiagramText(
   options: ExportTextOptions = {}
 ): string {
   const dsl = new DSL({ autoLayout: false });
-  const body = dsl.generate(diagram, { preserveIds: true, includeComments: false });
+  const body = dsl.generate(diagram, { preserveIds: true, includeComments: false, positions: options.positions === true });
   if (options.lossless === false) {
     return body;
   }
@@ -138,8 +161,11 @@ export function sanitizeForSidecar(doc: SerializedDiagram): SerializedDiagram {
   const links = ((doc.links as unknown as Array<Record<string, unknown>>) ?? []).map((l) => {
     const cleaned = stripState({ ...l });
     // Emptied, not deleted: LinkModel.fromJSON expects the array to exist. The
-    // routing pre-pass rebuilds the real polyline on the first frame.
-    cleaned['points'] = [];
+    // routing pre-pass rebuilds the real polyline on the first frame. A line
+    // bent BY HAND is the exception: its points are the user's bends, not
+    // derived state — stripped, every exported diagram lost them.
+    const meta = cleaned['metadata'] as Record<string, unknown> | undefined;
+    if (meta?.['hasManualWaypoints'] !== true) cleaned['points'] = [];
     return cleaned;
   });
   return { ...doc, nodes, links } as unknown as SerializedDiagram;
@@ -155,6 +181,10 @@ export function importDiagramText(
   text: string,
   options: ImportTextOptions = {}
 ): ImportTextResult {
+  return withImportTextMeasure(options.measureText, () => importDiagramTextNow(text, options));
+}
+
+function importDiagramTextNow(text: string, options: ImportTextOptions): ImportTextResult {
   const prefer = options.prefer ?? 'auto';
 
   // Line endings are TRANSPORT, not content. A file that crossed a Windows
@@ -207,6 +237,9 @@ export function importDiagramText(
   if (unsupported) {
     return { diagram: parsed, source: 'text', bodyEdited, sidecarInvalid, unsupported };
   }
+  // The parse above recovers line by line and never throws for what it skips;
+  // say what that was, so a caller can refuse the text (loadText does).
+  const errors = dsl.validate(body).errors;
 
   // THE MERGE. The grammar covers structure and labels — nothing else. Loading
   // the parsed body alone therefore wiped positions, sizes, styles, ports and
@@ -217,9 +250,9 @@ export function importDiagramText(
   // through untouched.
   if (sidecarDoc !== undefined && prefer !== 'text') {
     const diagram = applyBodyOntoSidecar(sidecarDoc, parsed, options);
-    return { diagram, source: 'text', bodyEdited, sidecarMerged: true, sidecarInvalid };
+    return { diagram, source: 'text', bodyEdited, sidecarMerged: true, sidecarInvalid, errors };
   }
-  return { diagram: parsed, source: 'text', bodyEdited, sidecarInvalid };
+  return { diagram: parsed, source: 'text', bodyEdited, sidecarInvalid, errors };
 }
 
 /**
@@ -313,6 +346,13 @@ function applyBodyOntoSidecar(
   // The body's direction is authoritative for the text form's own metadata.
   const direction = parsed.getMetadata?.('direction');
   if (direction !== undefined) base.setMetadata?.('direction', direction);
+  // …and so are its title and accessibility directives: the grammar says them, so
+  // an edit (or a deletion) in the body wins over the sidecar's copy.
+  for (const key of ['title', 'accTitle', 'accDescr']) {
+    const value = parsed.getMetadata(key);
+    if (value !== undefined) base.setMetadata(key, value);
+    else if (base.getMetadata(key) !== undefined) base.deleteMetadata(key);
+  }
 
   return base;
 }

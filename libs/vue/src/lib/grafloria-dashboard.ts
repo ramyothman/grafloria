@@ -13,6 +13,9 @@
  * `#widget-<kind>` slots render that widget kind with real Vue — the same
  * idiom as `#node-<type>` on the flow. Kinds without a slot fall back to the
  * kit's built-in painters (kpi / line / bar / donut / funnel / table).
+ * Removing a widget unmounts what its slot rendered; the other cards stay
+ * mounted. An `options.unmountWidget` still hears each host, after the card is
+ * gone.
  */
 import {
   defineComponent,
@@ -30,6 +33,7 @@ import {
   dashboard,
   render as renderSpec,
   defaultWidgetRenderer,
+  teardownInOrder,
   type DashboardHandle,
   type DashboardOptions,
   type DashboardSnapshot,
@@ -51,13 +55,29 @@ export const GrafloriaDashboard = defineComponent({
     options: { type: Object as PropType<Partial<DashboardOptions>>, default: () => ({}) },
     /** The visible view — `v-model:active-view`. */
     activeView: { type: String, default: undefined },
+    /**
+     * LIVE SWITCHES — the toolbar toggles as props: applied at mount (over
+     * `options`) and, when they change, through the handle (`setLayout` /
+     * `setSizing` / `setStatic`), never by remounting. 'split' is the
+     * DevExpress splitter tree; 'grid' the cell grid.
+     */
+    layout: { type: String as PropType<'grid' | 'split'>, default: undefined },
+    sizing: { type: String as PropType<'fit' | 'grow'>, default: undefined },
+    /** Static board: the viewer's mode — no drag, no resize, no handles. */
+    static: { type: Boolean, default: undefined },
   },
-  emits: ['update:activeView', 'ready', 'layoutChange'],
+  // Typed with their payloads (see GrafloriaFlow's emits).
+  emits: {
+    'update:activeView': (_view: string) => true,
+    ready: (_handle: DashboardHandle) => true,
+    layoutChange: (_change: { viewId: string; widgets: DashboardWidgetSpec[] }) => true,
+  },
   setup(props, { emit, slots, expose }) {
     const container = ref<HTMLElement | null>(null);
     const handle = shallowRef<DashboardHandle | null>(null);
     let instance: DiagramInstance | null = null;
-    const mounted = new Map<string, MountedWidget>();
+    // Keyed by host: a widget an undo or the camera brings back paints a new one.
+    const mounted = new Map<HTMLElement, MountedWidget>();
 
     const slotFor = (widget: DashboardWidgetSpec) => {
       const s: Slots = slots;
@@ -76,12 +96,23 @@ export const GrafloriaDashboard = defineComponent({
       );
     };
 
+    // The host is leaving the board (the widget was removed, or the board
+    // disposed): what its slot rendered there unmounts. A host a built-in
+    // painter drew holds no Vue tree, and rendering null into it does nothing.
+    const unmountWidget = (_id: string, hostEl: HTMLElement): void => {
+      mounted.delete(hostEl);
+      vueRender(null, hostEl);
+    };
+
     onMounted(() => {
       const el = container.value;
       if (!el) return;
 
       const spec = dashboard({
         ...props.options,
+        ...(props.layout !== undefined ? { layout: props.layout } : {}),
+        ...(props.sizing !== undefined ? { sizing: props.sizing } : {}),
+        ...(props.static !== undefined ? { static: props.static } : {}),
         ...(props.views ? { views: props.views } : {}),
         ...(!props.views && props.widgets ? { widgets: props.widgets } : {}),
         renderWidget: (widget, hostEl) => {
@@ -90,9 +121,10 @@ export const GrafloriaDashboard = defineComponent({
             return;
           }
           const entry: MountedWidget = { widget, element: hostEl };
-          mounted.set(widget.id, entry);
+          mounted.set(hostEl, entry);
           paintWidget(entry);
         },
+        unmountWidget: teardownInOrder(unmountWidget, props.options.unmountWidget),
         onLayoutChange: (viewId, widgets) => emit('layoutChange', { viewId, widgets }),
       });
 
@@ -119,6 +151,16 @@ export const GrafloriaDashboard = defineComponent({
       }
     );
 
+    // The switches: a changed prop is one handle call, never a remount.
+    // The prop names the BOARD's layout: every view, not only the visible tab.
+    watch(() => props.layout, (v) => {
+      const hnd = handle.value;
+      if (v === undefined || !hnd) return;
+      for (const id of hnd.views) if (hnd.getLayout(id) !== v) hnd.setLayout(v, id);
+    });
+    watch(() => props.sizing, (v) => { if (v !== undefined && handle.value && handle.value.getSizing() !== v) handle.value.setSizing(v); });
+    watch(() => props.static, (v) => { if (v !== undefined && handle.value && handle.value.getStatic() !== v) handle.value.setStatic(v); });
+
     onBeforeUnmount(() => {
       for (const entry of mounted.values()) vueRender(null, entry.element);
       mounted.clear();
@@ -133,6 +175,6 @@ export const GrafloriaDashboard = defineComponent({
     });
 
     return () =>
-      h('div', { ref: container, class: 'grafloria-dashboard', style: 'position:relative' });
+      h('div', { ref: container, class: 'grafloria-dashboard', style: 'width:100%;height:100%;position:relative' });
   },
 });

@@ -39,7 +39,7 @@
 // In programmatic (Canvas) mode there is no stylesheet at all, so layer 1 joins
 // the same spread (`includeThemeBase`), and the SAME precedence applies.
 
-import type { LinkModel, LinkStyle, NodeModel, NodeStyle } from '@grafloria/engine';
+import type { LinkModel, LinkStyle, NodeModel, NodeSelectionLook, NodeStyle } from '@grafloria/engine';
 import type { Theme } from '../types/theme.types';
 import { resolveStyleClasses } from './style-registry';
 
@@ -60,6 +60,13 @@ export interface CascadeOptions {
    * it would defeat the theme fallback and the CSS-variable scoping).
    */
   includeThemeBase?: boolean;
+  /**
+   * LINKS ONLY — the `highlightConnected` layer for a line touching the
+   * selection. It sits over the link's own style and its hover, and UNDER a
+   * selected or highlighted link's state: a line the user selected keeps the
+   * selection's look.
+   */
+  connection?: Partial<LinkStyle>;
 }
 
 /** Style keys that address the registry/DOM rather than a paint value. */
@@ -99,13 +106,21 @@ function nodeTypeDefaults(theme: Theme, type: string | undefined): Partial<NodeS
   return declared(theme.nodes[type] as Partial<NodeStyle> | undefined);
 }
 
-/** State layer: exclusive, highest precedence first. Mirrors the stylesheet's state rules. */
-function nodeStateStyle(node: NodeModel, theme: Theme): Partial<NodeStyle> {
+/**
+ * State layer: exclusive, highest precedence first. Mirrors the stylesheet's
+ * state rules. Selection paints what the node's selection LOOK allows: 'both'
+ * the fill and the border, 'border' the border only, 'ring' nothing (the ring
+ * is the whole sign, and the other states still speak for the body).
+ */
+function nodeStateStyle(node: NodeModel, theme: Theme, look: NodeSelectionLook): Partial<NodeStyle> {
   const c = theme.colors.node;
   const state = node.state;
 
-  if (state.selected) {
+  if (state.selected && look === 'both') {
     return { fill: c.selected.fill, stroke: c.selected.stroke, strokeWidth: 2 };
+  }
+  if (state.selected && look === 'border') {
+    return { stroke: c.selected.stroke, strokeWidth: 2 };
   }
   if (state.highlighted) {
     return { fill: c.highlighted.fill, stroke: c.highlighted.stroke, strokeWidth: 2 };
@@ -156,22 +171,61 @@ function shapeMetadataStyle(node: NodeModel): Partial<NodeStyle> {
   } as Partial<NodeStyle>);
 }
 
+/**
+ * A 'text' node is words with no box: its body is transparent, borderless and
+ * shadowless unless the node itself sets a fill or stroke (a highlighted note).
+ *
+ * An INK node (`shape.ink: true`) is a solid glyph in the diagram's text colour —
+ * a state diagram's start dot and bullseye, a fork/join bar. In CSS mode the
+ * stylesheet paints it (`.diagram-node.node-ink`, the theme's VARIABLE: one SVG,
+ * every theme, visible on a dark page); with no stylesheet the theme's literal
+ * joins the spread here. A node's own fill still wins (a classDef).
+ */
+function shapeKindStyle(node: NodeModel, theme: Theme, options: CascadeOptions): Partial<NodeStyle> {
+  const shape = node.getMetadata?.('shape') as { type?: string; ink?: boolean } | undefined;
+  if (shape?.ink) {
+    if (!options.includeThemeBase) return { shadow: false };
+    const ink = theme.colors.text.primary;
+    return { fill: ink, stroke: ink, shadow: false };
+  }
+  if (shape?.type !== 'text') return {};
+  return { fill: 'transparent', stroke: 'none', strokeWidth: 0, shadow: false };
+}
+
 /** Resolve a node's effective style. ONE ordered spread — see the header. */
 export function resolveNodeStyle(
   node: NodeModel,
   theme: Theme,
   options: CascadeOptions = {}
 ): Partial<NodeStyle> {
+  const below = belowStateNodeStyle(node, theme, options);
+  return { ...below, ...nodeStateStyle(node, theme, selectionLookOf(below, theme)) };
+}
+
+/** Every node layer UNDER state — what the node is when nothing is happening to it. */
+function belowStateNodeStyle(node: NodeModel, theme: Theme, options: CascadeOptions): Partial<NodeStyle> {
   return {
     ...(options.includeThemeBase ? nodeThemeBase(theme) : undefined),
     ...nodeTypeDefaults(theme, node.type),
+    ...shapeKindStyle(node, theme, options),
     ...resolveStyleClasses<NodeStyle>(node.style?.styleClass),
     // element-inline: the entity's own props, from BOTH places they can live.
     // The typed `node.style` wins over the legacy `metadata.shape` paints.
     ...shapeMetadataStyle(node),
     ...declared(node.style),
-    ...nodeStateStyle(node, theme),
   };
+}
+
+const selectionLookOf = (below: Partial<NodeStyle>, theme: Theme): NodeSelectionLook =>
+  below.selection ?? theme.nodes.default.selection ?? 'both';
+
+/**
+ * How this node shows it is selected, resolved through the cascade: its own
+ * style, a named style, its type's theme defaults, the theme-wide default —
+ * else 'both'. The renderer reads it for the ring and the CSS state class.
+ */
+export function resolveNodeSelectionLook(node: NodeModel, theme: Theme): NodeSelectionLook {
+  return selectionLookOf(belowStateNodeStyle(node, theme, {}), theme);
 }
 
 // ---------------------------------------------------------------------------
@@ -218,11 +272,16 @@ export function resolveLinkStyle(
   theme: Theme,
   options: CascadeOptions = {}
 ): Partial<LinkStyle> {
+  const state = linkStateStyle(link, theme);
+  const connection = options.connection;
+  const stateWins = link.state === 'selected' || link.state === 'highlighted';
   return {
     ...(options.includeThemeBase ? linkThemeBase(theme) : undefined),
     ...linkTypeDefaults(theme, link),
     ...resolveStyleClasses<LinkStyle>(link.style?.styleClass),
     ...declared(link.style),
-    ...linkStateStyle(link, theme),
+    ...(connection && stateWins ? connection : undefined),
+    ...state,
+    ...(connection && !stateWins ? connection : undefined),
   };
 }

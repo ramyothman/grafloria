@@ -22,7 +22,15 @@
  */
 import { ensureDiagramKitStyles } from './styles';
 import { bindRowInteractions } from './rows';
-import { entityCardContent, entityAutoHeight, erRowCenterY, ER_ROW_H, ER_HEAD_H } from './card';
+import {
+  entityCardContent,
+  entityAutoHeight,
+  entityAutoWidth,
+  erRowCenterY,
+  ER_ROW_H,
+  ER_HEAD_H,
+  cardHtml,
+} from './card';
 import { bindCardEditing } from './editing';
 
 // Layout constants + the row-centre helper live in card.ts now (the ONE source
@@ -30,7 +38,6 @@ import { bindCardEditing } from './editing';
 // keeps working.
 export { erRowCenterY, ER_ROW_H, ER_HEAD_H };
 
-const DEFAULT_WIDTH = 190;
 
 export interface ErColumn {
   name: string;
@@ -68,7 +75,17 @@ export interface ErRelationshipSpec {
   from: string;
   to: string;
   label?: string;
-  /** Named cardinality (default one-to-many) or explicit marker types. */
+  /**
+   * Named cardinality or explicit marker types. A name reads `from` → `to`, as
+   * Mermaid's `CUSTOMER ||--o{ ORDER` does: `one-to-many` puts the "one" end at
+   * `from` and the crow's foot at `to`.
+   *
+   * Omitted: one-to-many — except when the ends are COLUMNS and their flags say
+   * which is the foreign key: the FK column is then the "many" end, whichever
+   * way round the relationship is written. So `{ from: 'ORDER.customer_id', to:
+   * 'CUSTOMER.id' }` and `{ from: 'CUSTOMER.id', to: 'ORDER.customer_id' }` both
+   * put the crow's foot on ORDER.
+   */
   cardinality?: ErCardinality | { tail: string; head: string };
   fromSide?: ErSide;
   toSide?: ErSide;
@@ -109,6 +126,22 @@ interface ParsedEnd {
   rowIndex?: number;
 }
 
+/**
+ * The markers of a relationship that names no cardinality: one-to-many read
+ * `from` → `to` — unless the ends are columns and `from` is the foreign key
+ * (fk, not pk) pointing at a key (`to` is pk, not fk). Then the FK end is the
+ * "many" end: FK → PK is how a foreign key is usually written, and it used to
+ * draw the crow's foot on the referenced table.
+ */
+function defaultMarkers(from: ParsedEnd, to: ParsedEnd): { tail: string; head: string } {
+  const col = (end: ParsedEnd) => (end.rowIndex === undefined ? undefined : end.entity.columns[end.rowIndex]);
+  const a = col(from), b = col(to);
+  const fromIsForeignKey = !!a?.fk && !a.pk;
+  const toIsKey = !!b?.pk && !b.fk;
+  if (fromIsForeignKey && toIsKey) return { tail: CARDINALITY['one-to-many'].head, head: CARDINALITY['one-to-many'].tail };
+  return CARDINALITY['one-to-many'];
+}
+
 function parseEnd(ref: string, byId: Map<string, ErEntitySpec>): ParsedEnd {
   const dot = ref.indexOf('.');
   const entityId = dot === -1 ? ref : ref.slice(0, dot);
@@ -128,8 +161,9 @@ function parseEnd(ref: string, byId: Map<string, ErEntitySpec>): ParsedEnd {
  *
  * Entities become HTML table cards; relationships become orthogonal edges with
  * crow's-foot cardinality. A `TABLE.column` end pins the edge to that row via
- * an absolute-layout port (the FK→PK look). Two edges landing on the same
- * column are automatically spread apart.
+ * an absolute-layout port, so a relationship can join the exact key columns.
+ * Two edges landing on the same column are automatically spread apart. Which
+ * end is the "many" end: see {@link ErRelationshipSpec.cardinality}.
  */
 export function erDiagram(options: ErDiagramOptions): {
   nodes: Array<Record<string, unknown>>;
@@ -145,7 +179,10 @@ export function erDiagram(options: ErDiagramOptions): {
   // spread (dy) so shared columns (a PK referenced twice) don't stack.
   const rowLandings = new Map<string, number>();
 
-  const width = (e: ErEntitySpec) => e.width ?? DEFAULT_WIDTH;
+  // Width is derived from content the same way height is, so a long column name
+  // or table title widens the card instead of falling off it. Ports read this
+  // same function, so they stay glued to the edge whatever it works out to.
+  const width = (e: ErEntitySpec) => entityAutoWidth(e, options.editable === true);
 
   const fieldPort = (end: ParsedEnd, side: ErSide): string => {
     const entity = end.entity;
@@ -184,7 +221,9 @@ export function erDiagram(options: ErDiagramOptions): {
     const markers =
       typeof rel.cardinality === 'object'
         ? rel.cardinality
-        : CARDINALITY[rel.cardinality ?? 'one-to-many'];
+        : rel.cardinality !== undefined
+          ? CARDINALITY[rel.cardinality]
+          : defaultMarkers(from, to);
 
     return {
       id: rel.id ?? `er-rel-${i + 1}`,
@@ -211,7 +250,7 @@ export function erDiagram(options: ErDiagramOptions): {
     // interactive: rows are real DOM targets (hover, row selection, inline
     // editing) — node drag/select stay geometric in the binder.
     metadata: {
-      html: { content: entityCardContent(entity, editable), interactive: true },
+      html: cardHtml(entityCardContent(entity, editable)),
       kitEntity: entity,
       kitEditable: editable,
       // Only the OPT-OUT is recorded. A loader has to know not to re-bind row

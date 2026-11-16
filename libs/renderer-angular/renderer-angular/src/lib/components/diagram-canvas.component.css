@@ -30,7 +30,9 @@
   z-index: 1; /* Below HTML layer */
 }
 
-.grafloria-svg-layer svg {
+/* The renderer's <svg> is created imperatively, so an encapsulated rule cannot
+   reach it: ::ng-deep. Its pointer-events are also set inline by renderDiagram(). */
+.grafloria-svg-layer ::ng-deep > svg {
   display: block;
   width: 100%;
   height: 100%;
@@ -137,6 +139,11 @@
   fill: #ffffff;
   stroke: #3b82f6;
   pointer-events: auto;
+}
+
+.grafloria-tool-resize-edge {
+  fill: none;
+  pointer-events: stroke;
 }
 
 .grafloria-tool-rotate {

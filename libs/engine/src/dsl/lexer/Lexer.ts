@@ -166,8 +166,13 @@ export class Lexer {
         break;
 
       case '"':
-      case "'":
         this.scanString(char, start, startColumn);
+        break;
+
+      // NOT a string delimiter: Mermaid quotes with `"` only, so `[I'm here]` is
+      // the text "I'm here" (it was an unclosed quote that refused the line).
+      case "'":
+        this.addToken(TokenType.UNKNOWN, char, start, this.position);
         break;
 
       default:
@@ -302,22 +307,51 @@ export class Lexer {
   }
 
   /**
-   * Scan less-than combinations: <-->
+   * Scan less-than combinations: `<-->`, `<-.->`, `<==>` — an arrow at BOTH ends —
+   * and the `<--` that opens an inline label (`A <-- text --> B`).
    */
   private scanLessThan(start: number, startColumn: number): void {
-    if (this.peek() === '-' && this.peekNext() === '-') {
-      this.advance(); // -
-      this.advance(); // -
-      if (this.peek() === '>') {
-        this.advance(); // >
-        this.addToken(TokenType.BIDIRECTIONAL, '<-->', start, this.position);
-      } else {
-        // Just <-- (not standard, treat as unknown)
-        this.addToken(TokenType.UNKNOWN, this.input.substring(start, this.position), start, this.position);
-      }
-    } else {
+    if (!this.scanMarkedLink(start)) {
       this.addToken(TokenType.UNKNOWN, '<', start, this.position);
     }
+  }
+
+  /** Does a link body (`--`, `-.`, `==`) start at the current position? */
+  private atLinkBody(): boolean {
+    const next = this.peek();
+    const after = this.peekNext();
+    return (next === '-' && (after === '-' || after === '.')) || (next === '=' && after === '=');
+  }
+
+  /**
+   * A link whose START marker (`<`, `o` or `x`, at `start`) was just consumed:
+   * scan its body and end, so `<-->`, `o--o` and `x-.-x` are ONE token whose text
+   * keeps the marker. Consumes nothing and returns false when no body follows.
+   */
+  private scanMarkedLink(start: number): boolean {
+    if (!this.atLinkBody()) return false;
+    const first = this.advance();
+    if (first === '=') this.scanEquals(start, 0);
+    else this.scanDash(start, 0);
+    return true;
+  }
+
+  /**
+   * After a node, `o` / `x` glued to a link body is the link's START marker
+   * (`A o--o B`, `A x--x B`), not a node: Mermaid's link token takes it first.
+   */
+  private isStartMarker(value: string): boolean {
+    if ((value !== 'o' && value !== 'x') || !this.atLinkBody()) return false;
+    const previous = this.tokens[this.tokens.length - 1];
+    return (
+      !!previous &&
+      [
+        TokenType.IDENTIFIER, TokenType.NUMBER, TokenType.STRING,
+        TokenType.SQUARE_CLOSE, TokenType.SUBROUTINE_CLOSE, TokenType.STADIUM_CLOSE,
+        TokenType.CYLINDRICAL_CLOSE, TokenType.CIRCLE_CLOSE, TokenType.ROUND_CLOSE,
+        TokenType.RHOMBUS_CLOSE, TokenType.HEXAGON_CLOSE, TokenType.TRAPEZOID_CLOSE,
+      ].includes(previous.type)
+    );
   }
 
   /**
@@ -333,7 +367,9 @@ export class Lexer {
       const terminator = this.peek();
       if (terminator === '>') {
         this.advance();
-        this.addToken(TokenType.ARROW, this.input.substring(start, this.position), start, this.position);
+        // `<-->`: an arrow at both ends.
+        const type = this.input[start] === '<' ? TokenType.BIDIRECTIONAL : TokenType.ARROW;
+        this.addToken(type, this.input.substring(start, this.position), start, this.position);
       } else if (terminator === 'o') {
         this.advance();
         this.addToken(TokenType.CIRCLE_EDGE, this.input.substring(start, this.position), start, this.position);
@@ -346,7 +382,9 @@ export class Lexer {
     } else if (this.peek() === '.') {
       // Dotted edge, ANY length: -.-, -.->, -..-> (extra dots lengthen it).
       while (this.peek() === '.' || this.peek() === '-') this.advance();
-      if (this.peek() === '>') {
+      // `-.->` an arrow; `-.-o` / `-.-x` a circle / cross end (a marker, like `>`).
+      const marker = this.peek() === '>' || (this.input[this.position - 1] === '-' && (this.peek() === 'o' || this.peek() === 'x'));
+      if (marker) {
         this.advance();
         this.addToken(TokenType.DOTTED_ARROW, this.input.substring(start, this.position), start, this.position);
       } else {
@@ -358,23 +396,23 @@ export class Lexer {
   }
 
   /**
-   * Scan equals combinations: ==>, ===
+   * Scan equals combinations: `==>` thick arrow (Mermaid's own spelling — only
+   * `===>` used to lex, so `A ==> B` drew nothing), `===` or longer a thick line,
+   * and a bare `==` — the opener of an inline label, `A == text ==> B`.
    */
-  private scanEquals(start: number, startColumn: number): void {
-    if (this.peek() === '=' && this.peekNext() === '=') {
-      this.advance(); // second =
-      this.advance(); // third =
-
-      if (this.peek() === '>') {
-        // Thick arrow: ==>
-        this.advance(); // >
-        this.addToken(TokenType.THICK_ARROW, '==>', start, this.position);
-      } else {
-        // Thick line: ===
-        this.addToken(TokenType.THICK_LINE, '===', start, this.position);
-      }
+  private scanEquals(start: number, _startColumn: number): void {
+    let count = 1;
+    while (this.peek() === '=') {
+      this.advance();
+      count++;
+    }
+    // `==>` an arrow; `==o` / `==x` a circle / cross end.
+    if (count >= 2 && (this.peek() === '>' || this.peek() === 'o' || this.peek() === 'x')) {
+      this.advance();
+      this.addToken(TokenType.THICK_ARROW, this.input.substring(start, this.position), start, this.position);
+    } else if (count >= 2) {
+      this.addToken(TokenType.THICK_LINE, this.input.substring(start, this.position), start, this.position);
     } else {
-      // Single = (unknown)
       this.addToken(TokenType.UNKNOWN, '=', start, this.position);
     }
   }
@@ -383,6 +421,17 @@ export class Lexer {
    * Scan dot (for dotted lines) - already handled in scanDash
    */
   private scanDot(start: number, startColumn: number): void {
+    // `.->` / `.-` close a dotted inline label: `A -. note .-> B`.
+    if (this.peek() === '-') {
+      this.advance();
+      if (this.peek() === '>' || this.peek() === 'o' || this.peek() === 'x') {
+        this.advance();
+        this.addToken(TokenType.DOTTED_ARROW, this.input.substring(start, this.position), start, this.position);
+      } else {
+        this.addToken(TokenType.DOTTED_LINE, '.-', start, this.position);
+      }
+      return;
+    }
     this.addToken(TokenType.UNKNOWN, '.', start, this.position);
   }
 
@@ -391,6 +440,9 @@ export class Lexer {
    */
   private scanString(quote: string, start: number, startColumn: number): void {
     let value = '';
+    // A string may span lines (a quoted multi-line label); its token still
+    // belongs to the line it OPENED on, which is where an error must point.
+    const startLine = this.line;
 
     while (!this.isAtEnd() && this.peek() !== quote) {
       if (this.peek() === '\n') {
@@ -401,15 +453,22 @@ export class Lexer {
     }
 
     if (this.isAtEnd()) {
-      // Unterminated string
-      this.addToken(TokenType.UNKNOWN, quote + value, start, this.position);
+      // Unterminated: the stray quote runs to the end of ITS line, not of the
+      // text. Swallowing every line after it lost the rest of the diagram from
+      // even a best-effort parse; the parser reports the quote at its line.
+      const newline = this.input.indexOf('\n', start);
+      const stop = newline < 0 ? this.input.length : newline;
+      this.position = stop;
+      this.line = startLine;
+      this.column = startColumn + (stop - start);
+      this.tokens.push(createToken(TokenType.UNKNOWN, this.input.substring(start, stop), startLine, startColumn, start, stop));
       return;
     }
 
     // Consume closing quote
     this.advance();
 
-    this.addToken(TokenType.STRING, value, start, this.position);
+    this.tokens.push(createToken(TokenType.STRING, value, startLine, startColumn, start, this.position));
   }
 
   /**
@@ -449,6 +508,7 @@ export class Lexer {
     }
 
     const value = this.input.substring(start, this.position);
+    if (this.isStartMarker(value) && this.scanMarkedLink(start)) return;
     const type = this.getKeywordType(value);
 
     this.addToken(type, value, start, this.position);
@@ -472,13 +532,17 @@ export class Lexer {
    * Get keyword token type
    */
   private getKeywordType(value: string): TokenType {
+    // Mermaid's flowchart lexer is case-SENSITIVE for these two: `End` and `END`
+    // are node ids (its docs tell authors to capitalise `end` for exactly that),
+    // and reading them as the keyword refused `Handler --> End[…]`.
+    if (value === 'subgraph') return TokenType.SUBGRAPH;
+    if (value === 'end') return TokenType.END;
+
     const lower = value.toLowerCase();
 
     const keywords: Record<string, TokenType> = {
       'flowchart': TokenType.FLOWCHART,
       'graph': TokenType.GRAPH,
-      'subgraph': TokenType.SUBGRAPH,
-      'end': TokenType.END,
       'bpmn': TokenType.BPMN,
       'erd': TokenType.ERD,
       'classDiagram': TokenType.CLASSDIAAGRAM,

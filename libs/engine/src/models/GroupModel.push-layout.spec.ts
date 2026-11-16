@@ -26,6 +26,15 @@ function widget(width: number, height: number): NodeModel {
   });
 }
 
+// S2: a layout fills the frame's CONTENT box (inside padding, below the title
+// band). These pixel specs were written for a container with no chrome, so they
+// say so instead of inheriting the default padding and header.
+function chromeless(g: GroupModel): GroupModel {
+  g.padding = 0;
+  g.headerHeight = 0;
+  return g;
+}
+
 describe('GroupModel — push-driven layout (A)', () => {
   let diagram: DiagramModel;
 
@@ -35,6 +44,7 @@ describe('GroupModel — push-driven layout (A)', () => {
 
   function dashboard(width = 1200, height = 800): GroupModel {
     const g = new GroupModel({ name: 'Dashboard' });
+    chromeless(g);
     g.size = { width, height, depth: 0 };
     diagram.addGroup(g);
     g.setLayout('flexbox', {
@@ -81,6 +91,7 @@ describe('GroupModel — push-driven layout (A)', () => {
 
     it('does nothing for a container that declares no layout', () => {
       const g = new GroupModel({ name: 'Plain' });
+      chromeless(g);
       g.size = { width: 500, height: 500, depth: 0 };
       diagram.addGroup(g);
       const w = widget(10, 10);
@@ -208,6 +219,7 @@ describe('GroupModel — push-driven layout (A)', () => {
 
     it('terminates for a nested container whose parent lays it out', () => {
       const outer = new GroupModel({ name: 'Outer' });
+      chromeless(outer);
       outer.size = { width: 800, height: 600, depth: 0 };
       diagram.addGroup(outer);
       outer.setLayout('flexbox', {
@@ -221,6 +233,8 @@ describe('GroupModel — push-driven layout (A)', () => {
       });
 
       const inner = new GroupModel({ name: 'Inner' });
+
+      chromeless(inner);
       inner.size = { width: 400, height: 200, depth: 0 };
       diagram.addGroup(inner);
       inner.setLayout('flexbox', {
@@ -247,6 +261,84 @@ describe('GroupModel — push-driven layout (A)', () => {
       outer.setFrame({ x: 100, y: 100, width: 800, height: 600 });
       expect(inner.position.x).toBe(100);
       expect(leaf.position.x).toBe(100);
+    });
+  });
+
+  // C5 (docs review v3): a container layout placed a nested PLAIN group (no layout
+  // of its own) by moving its frame only — its members stayed behind, outside it.
+  describe('a nested group without a layout of its own', () => {
+    function setup() {
+      const outer = new GroupModel({ name: 'Outer' });
+      chromeless(outer);
+      diagram.addGroup(outer);
+      outer.setFrame({ x: 80, y: 70, width: 460, height: 300 });
+      const a = widget(120, 60);
+      a.setPosition(120, 130);
+      diagram.addNode(a);
+      outer.addMember(a.id, diagram);
+
+      const inner = new GroupModel({ name: 'Inner' });
+
+      chromeless(inner);
+      diagram.addGroup(inner);
+      inner.setFrame({ x: 300, y: 180, width: 200, height: 150 });
+      const r = widget(120, 60);
+      r.setPosition(340, 230);
+      diagram.addNode(r);
+      inner.addMember(r.id, diagram);
+      const deep = new GroupModel({ name: 'Deep' });
+      chromeless(deep);
+      diagram.addGroup(deep);
+      deep.setFrame({ x: 320, y: 200, width: 60, height: 40 });
+      inner.addMember(deep.id, diagram);
+      inner.setParent(outer.id, diagram);
+      outer.addMember(inner.id, diagram);
+      return { outer, inner, deep, r };
+    }
+
+    it('carries its members (and nested frames) with its frame', () => {
+      const { outer, inner, deep, r } = setup();
+      const before = { inner: inner.getOuterBounds(), r: { ...r.position }, deep: deep.getOuterBounds() };
+
+      outer.setLayout('flexbox', {
+        direction: 'row', wrap: 'nowrap', justifyContent: 'start', alignItems: 'start',
+        alignContent: 'start', gap: 24, padding: { top: 48, right: 16, bottom: 16, left: 16 },
+      });
+      outer.applyLayout(diagram);
+
+      const after = inner.getOuterBounds();
+      const dx = after.x - before.inner.x;
+      const dy = after.y - before.inner.y;
+      expect(Math.abs(dx) + Math.abs(dy)).toBeGreaterThan(0); // the layout did move it
+      expect(r.position.x).toBeCloseTo(before.r.x + dx);
+      expect(r.position.y).toBeCloseTo(before.r.y + dy);
+      expect(deep.getOuterBounds().x).toBeCloseTo(before.deep.x + dx);
+      expect(deep.getOuterBounds().y).toBeCloseTo(before.deep.y + dy);
+      // …so the member is still inside its group.
+      expect(r.position.x).toBeGreaterThanOrEqual(after.x);
+      expect(r.position.y).toBeGreaterThanOrEqual(after.y);
+      expect(r.position.x + 120).toBeLessThanOrEqual(after.x + after.width);
+      expect(r.position.y + 60).toBeLessThanOrEqual(after.y + after.height);
+    });
+
+    it('a deeper container WITH its own layout is not moved twice', () => {
+      const { outer, deep } = setup();
+      const leaf = widget(20, 20);
+      diagram.addNode(leaf);
+      deep.addMember(leaf.id, diagram);
+      deep.setLayout('flexbox', {
+        direction: 'row', wrap: 'nowrap', justifyContent: 'start', alignItems: 'start',
+        alignContent: 'start', gap: 0, padding: 0,
+      });
+      outer.setLayout('flexbox', {
+        direction: 'row', wrap: 'nowrap', justifyContent: 'start', alignItems: 'start',
+        alignContent: 'start', gap: 24, padding: { top: 48, right: 16, bottom: 16, left: 16 },
+      });
+      outer.applyLayout(diagram);
+      // Its own flex layout keeps its member at its (padding-less) origin.
+      const b = deep.getOuterBounds();
+      expect(leaf.position.x).toBeCloseTo(b.x);
+      expect(leaf.position.y).toBeCloseTo(b.y);
     });
   });
 });
